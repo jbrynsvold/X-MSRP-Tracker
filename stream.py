@@ -4,6 +4,8 @@ import requests
 import logging
 import time
 import re
+import hashlib
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -52,6 +54,9 @@ ALERT_COLORS = {
     "alert": 0x3498DB,
 }
 
+DEDUP_WINDOW_HOURS = 2
+seen_fingerprints: dict = {}
+
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s %(message)s",
@@ -96,6 +101,24 @@ def set_rules():
     )
     resp.raise_for_status()
     log.info(f"Stream rules set: {rule}")
+
+# ===========================================================================
+# Deduplication
+# ===========================================================================
+
+def make_fingerprint(alert_type: str, store: str, product: str) -> str:
+    key = f"{alert_type}|{store or ''}|{product[:30].lower().strip()}"
+    return hashlib.md5(key.encode()).hexdigest()
+
+def is_duplicate(fingerprint: str) -> bool:
+    now = datetime.utcnow()
+    if fingerprint in seen_fingerprints:
+        if now - seen_fingerprints[fingerprint] < timedelta(hours=DEDUP_WINDOW_HOURS):
+            return True
+        else:
+            del seen_fingerprints[fingerprint]
+    seen_fingerprints[fingerprint] = now
+    return False
 
 # ===========================================================================
 # Tweet parsing
@@ -192,6 +215,11 @@ def post_discord(tweet_data: dict, author_username: str):
     color          = ALERT_COLORS.get(alert_type, 0x3498DB)
     alert_emoji    = ALERT_EMOJIS.get(alert_type, "📣")
     category_label = CATEGORY_EMOJIS.get(category, "🃏 Trading Cards")
+
+    fingerprint = make_fingerprint(alert_type, store, product)
+    if is_duplicate(fingerprint):
+        log.info(f"Duplicate suppressed: {alert_type.upper()} — {product[:40]} via @{author_username}")
+        return
 
     lines = []
     if store:
