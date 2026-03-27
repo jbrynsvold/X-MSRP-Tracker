@@ -287,18 +287,3 @@ if __name__ == "__main__":
             log.error(f"Unexpected error: {e} — reconnecting in 10s...")
             time.sleep(5)
         time.sleep(5)
-```
-
----
-
-**`requirements.txt`**
-```
-requests
-python-dotenv
-```
-
----
-
-**`Procfile`**
-```
-worker: python stream.py
