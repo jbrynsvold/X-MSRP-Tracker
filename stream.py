@@ -20,6 +20,15 @@ ACCOUNTS = [
     "PokemonDealsTCG",
     "ricanking6",
     "PokeAlerts_",
+    "LuckyPawTCG",
+    "PTCGrestock",
+    "PokeTCGAlerts",
+    "OnePieceAlerts",
+    "PokemonFindr",
+    "DropDexHQ",
+    "VIVID_RESTOCK",
+    "pokepullzhq",
+    "Detailed91"
 ]
 
 ALERT_EMOJIS = {
@@ -302,6 +311,8 @@ def stream():
 
 if __name__ == "__main__":
     log.info("Restock stream starting...")
+    log.info("Waiting 30s for any previous connections to close...")
+    time.sleep(30)
     set_rules()
 
     while True:
