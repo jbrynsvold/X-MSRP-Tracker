@@ -138,9 +138,9 @@ def detect_category(text: str) -> str:
     text_lower = text.lower()
     if any(w in text_lower for w in ["pokemon", "pokémon", "tcg", "poke"]):
         return "pokemon"
-    if any(w in text_lower for w in ["football", "nfl", "panini"]):
+    if any(w in text_lower for w in ["football", "nfl"]):
         return "football"
-    if any(w in text_lower for w in ["baseball", "mlb", "topps"]):
+    if any(w in text_lower for w in ["baseball", "mlb"]):
         return "baseball"
     if any(w in text_lower for w in ["basketball", "nba"]):
         return "basketball"
