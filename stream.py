@@ -63,6 +63,23 @@ ALERT_COLORS = {
     "alert": 0x3498DB,
 }
 
+GIVEAWAY_BLOCKLIST = [
+    "giveaway",
+    "give away",
+    "enter to win",
+    "win a ",
+    "chance to win",
+    "retweet to win",
+    "follow to win",
+    "contest",
+    "sweepstakes",
+    "slab code",
+    "enter our",
+    "entering our",
+    "🎁",
+    "🏆",
+]
+
 DEDUP_WINDOW_HOURS = 2
 seen_fingerprints: dict = {}
 
@@ -128,6 +145,14 @@ def is_duplicate(fingerprint: str) -> bool:
             del seen_fingerprints[fingerprint]
     seen_fingerprints[fingerprint] = now
     return False
+
+# ===========================================================================
+# Giveaway filter
+# ===========================================================================
+
+def is_giveaway(text: str) -> bool:
+    text_lower = text.lower()
+    return any(phrase in text_lower for phrase in GIVEAWAY_BLOCKLIST)
 
 # ===========================================================================
 # Tweet parsing
@@ -200,7 +225,8 @@ def extract_product(text: str) -> str:
             continue
         if re.match(r'^[\$\d\s\.]+$', line):
             continue
-        if any(s.lower() in line.lower() for s in list(STORE_MAP.values())):
+        # Only skip if the line is exactly a store name, not if it merely contains one
+        if any(line.strip().lower() == s.lower() for s in list(STORE_MAP.values())):
             continue
         product_lines.append(line)
 
@@ -214,6 +240,11 @@ def post_discord(tweet_data: dict, author_username: str):
     text       = tweet_data.get("text", "")
     tweet_id   = tweet_data.get("id", "")
     tweet_url  = f"https://x.com/{author_username}/status/{tweet_id}"
+
+    # Filter giveaways before any further processing
+    if is_giveaway(text):
+        log.info(f"Giveaway filtered: @{author_username} — {text[:60]}")
+        return
 
     alert_type     = detect_alert_type(text)
     category       = detect_category(text)
