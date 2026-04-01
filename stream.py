@@ -54,6 +54,10 @@ STORE_MAP = {
     "gamestop": "GameStop",
     "bestbuy": "Best Buy",
     "toysrus": "Toys R Us",
+    "dick's": "Dick's Sporting Goods",
+    "dicks": "Dick's Sporting Goods",
+    "scheels": "Scheels",
+    "best buy": "Best Buy",
 }
 
 ALERT_COLORS = {
@@ -63,7 +67,31 @@ ALERT_COLORS = {
     "alert": 0x3498DB,
 }
 
-GIVEAWAY_BLOCKLIST = [
+# ---------------------------------------------------------------------------
+# ALLOWLIST — tweet must match at least one of these patterns to be posted.
+# If none match, the tweet is silently dropped.
+# ---------------------------------------------------------------------------
+REQUIRED_SIGNALS = [
+    r'\$[\d,]+\.?\d*',               # price ($29.99, $1,299)
+    r'\bin stock\b',
+    r'\brestock\b',
+    r'\bpreorder\b',
+    r'\bpre-order\b',
+    r'\bpre order\b',
+    r'\breservation\b',
+    r'\bavailable\b',
+    r'\bdrops?\s+(now|today|live)\b',
+    r'\bjust\s+dropped\b',
+    r'\bback\s+in\s+stock\b',
+    r'\blive\s+now\b',
+]
+
+# ---------------------------------------------------------------------------
+# BLOCKLIST — tweet is dropped if any phrase matches, regardless of signals.
+# Evaluated AFTER the allowlist so a price in a giveaway post still gets killed.
+# ---------------------------------------------------------------------------
+HARD_BLOCKLIST = [
+    # Giveaways / contests
     "giveaway",
     "give away",
     "enter to win",
@@ -78,6 +106,46 @@ GIVEAWAY_BLOCKLIST = [
     "entering our",
     "🎁",
     "🏆",
+    # Engagement bait / polls / opinion posts
+    "what's your favourite",
+    "what is your favourite",
+    "what's your favorite",
+    "what is your favorite",
+    "without price in mind",
+    "favourite card",
+    "favorite card",
+    "who would win",
+    "which is better",
+    "which do you prefer",
+    "\bpoll\b",
+    # Community / fan content
+    "shout-out sunday",
+    "shoutout sunday",
+    "built in pokopia",
+    "spotted in pokopia",
+    "custom cherry blossom",
+    "reddit u/",                     # user-generated content shares
+    # Meta / commentary posts
+    "just another account",
+    "fake news",
+    "posting fake news",
+    "reputable accounts",
+    # Non-card membership deals
+    "sam's club membership",
+    "sams club membership",
+    "membership deal",
+    "1-year membership",
+    "plus membership",               # Sam's Club plan name
+    "basic membership",              # Sam's Club plan name
+    # Hype / no-action posts
+    "next week is going to be huge",
+    "good luck if you're opening",
+    "have a great weekend",
+    "keep an eye out",
+    # Artist / influencer shoutouts
+    "commission",
+    "went viral",
+    "joined twitter",
 ]
 
 DEDUP_WINDOW_HOURS = 2
@@ -129,6 +197,34 @@ def set_rules():
     log.info(f"Stream rules set: {rule}")
 
 # ===========================================================================
+# Filtering — allowlist-first, then blocklist
+# ===========================================================================
+
+def has_deal_signal(text: str) -> bool:
+    """Returns True only if the tweet contains at least one actionable deal signal."""
+    text_lower = text.lower()
+    return any(re.search(pattern, text_lower) for pattern in REQUIRED_SIGNALS)
+
+def is_blocked(text: str) -> bool:
+    """Returns True if the tweet matches any hard-blocklist phrase."""
+    text_lower = text.lower()
+    return any(re.search(phrase, text_lower) for phrase in HARD_BLOCKLIST)
+
+def should_post(text: str, author_username: str) -> bool:
+    """
+    Gate logic (order matters):
+      1. Must have at least one deal signal — kills engagement/fan/hype posts.
+      2. Must not match the blocklist — kills giveaways, membership deals, etc.
+    """
+    if not has_deal_signal(text):
+        log.info(f"Dropped (no deal signal): @{author_username} — {text[:80]}")
+        return False
+    if is_blocked(text):
+        log.info(f"Dropped (blocklist): @{author_username} — {text[:80]}")
+        return False
+    return True
+
+# ===========================================================================
 # Deduplication
 # ===========================================================================
 
@@ -145,14 +241,6 @@ def is_duplicate(fingerprint: str) -> bool:
             del seen_fingerprints[fingerprint]
     seen_fingerprints[fingerprint] = now
     return False
-
-# ===========================================================================
-# Giveaway filter
-# ===========================================================================
-
-def is_giveaway(text: str) -> bool:
-    text_lower = text.lower()
-    return any(phrase in text_lower for phrase in GIVEAWAY_BLOCKLIST)
 
 # ===========================================================================
 # Tweet parsing
@@ -225,7 +313,6 @@ def extract_product(text: str) -> str:
             continue
         if re.match(r'^[\$\d\s\.]+$', line):
             continue
-        # Only skip if the line is exactly a store name, not if it merely contains one
         if any(line.strip().lower() == s.lower() for s in list(STORE_MAP.values())):
             continue
         product_lines.append(line)
@@ -241,9 +328,8 @@ def post_discord(tweet_data: dict, author_username: str):
     tweet_id   = tweet_data.get("id", "")
     tweet_url  = f"https://x.com/{author_username}/status/{tweet_id}"
 
-    # Filter giveaways before any further processing
-    if is_giveaway(text):
-        log.info(f"Giveaway filtered: @{author_username} — {text[:60]}")
+    # Single gate — allowlist signal required, blocklist kills it
+    if not should_post(text, author_username):
         return
 
     alert_type     = detect_alert_type(text)
