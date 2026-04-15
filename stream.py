@@ -281,15 +281,41 @@ def detect_price(text: str) -> str:
     match = re.search(r'\$[\d,]+\.?\d*', text)
     return match.group(0) if match else None
 
-def extract_links(text: str) -> list:
-    urls = re.findall(r'https?://\S+', text)
+def extract_links_with_labels(text: str) -> list:
+    """
+    Returns a list of (label, url) tuples.
+    Handles patterns like:
+      - Hobby Box: https://...
+      - Hobby Box: https://...
+      Raw URLs with no label get label=None.
+    """
     skip = ["trackalacker.com", "twitter.com/intent", "t.co/"]
-    clean = []
-    for url in urls:
+
+    # Match optional leading dash + label + colon + URL
+    labeled_pattern = re.compile(
+        r'-\s*([^:\n\-]{2,40}?)\s*:\s*(https?://\S+)', re.IGNORECASE
+    )
+    results = []
+    matched_urls = set()
+
+    for m in labeled_pattern.finditer(text):
+        label = m.group(1).strip().title()
+        url   = m.group(2).rstrip('.,)')
+        if any(s in url for s in skip):
+            continue
+        results.append((label, url))
+        matched_urls.add(url)
+
+    # Pick up any remaining raw URLs not already captured
+    for url in re.findall(r'https?://\S+', text):
         url = url.rstrip('.,)')
-        if not any(s in url for s in skip):
-            clean.append(url)
-    return clean[:4]
+        if url in matched_urls:
+            continue
+        if any(s in url for s in skip):
+            continue
+        results.append((None, url))
+
+    return results[:6]
 
 def extract_product(text: str) -> str:
     text = re.sub(r'#\w+', '', text)
@@ -324,9 +350,9 @@ def extract_product(text: str) -> str:
 # ===========================================================================
 
 def post_discord(tweet_data: dict, author_username: str):
-    text       = tweet_data.get("text", "")
-    tweet_id   = tweet_data.get("id", "")
-    tweet_url  = f"https://x.com/{author_username}/status/{tweet_id}"
+    text      = tweet_data.get("text", "")
+    tweet_id  = tweet_data.get("id", "")
+    tweet_url = f"https://x.com/{author_username}/status/{tweet_id}"
 
     # Single gate — allowlist signal required, blocklist kills it
     if not should_post(text, author_username):
@@ -336,7 +362,7 @@ def post_discord(tweet_data: dict, author_username: str):
     category       = detect_category(text)
     store          = detect_store(text)
     price          = detect_price(text)
-    links          = extract_links(text)
+    labeled_links  = extract_links_with_labels(text)
     product        = extract_product(text)
     color          = ALERT_COLORS.get(alert_type, 0x3498DB)
     alert_emoji    = ALERT_EMOJIS.get(alert_type, "📣")
@@ -347,23 +373,37 @@ def post_discord(tweet_data: dict, author_username: str):
         log.info(f"Duplicate suppressed: {alert_type.upper()} — {product[:40]} via @{author_username}")
         return
 
-    lines = []
+    # Build meta line: store and/or price
+    meta_parts = []
     if store:
-        lines.append(f"🏪 {store}")
+        meta_parts.append(f"🏪 {store}")
     if price:
-        lines.append(f"💰 {price}")
+        meta_parts.append(f"💰 {price}")
+
+    # Build link line: use labels where available, fallback to generic
+    link_parts = []
+    for i, (label, url) in enumerate(labeled_links):
+        if label:
+            link_parts.append(f"[{label}]({url})")
+        else:
+            display = "View Deal" if i == 0 else f"Alt Link {i + 1}"
+            link_parts.append(f"[{display}]({url})")
+
+    first_url = labeled_links[0][1] if labeled_links else tweet_url
+
+    lines = []
     if product:
-        lines.append(f"\n📦 {product}")
-    if links:
-        lines.append("\n🔗 " + "  ".join(links))
-    lines.append(f"\n📡 via @{author_username}")
-    lines.append(f"🐦 {tweet_url}")
+        lines.append(f"📦 {product}")
+    if meta_parts:
+        lines.append("  ·  ".join(meta_parts))
+    if link_parts:
+        lines.append("\n🔗 " + "  ·  ".join(link_parts))
 
     embed = {
-        "title": f"{alert_emoji} {alert_type.upper()} — {category_label}",
+        "title": f"{alert_emoji} {category_label} — {alert_type.upper()}",
         "description": '\n'.join(lines),
         "color": color,
-        "url": tweet_url,
+        "url": first_url,
     }
 
     resp = requests.post(
