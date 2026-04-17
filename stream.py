@@ -289,11 +289,9 @@ def extract_links_with_labels(text: str, entities: dict = None) -> list:
     Returns list of (label, url) tuples. Label may be None.
     """
     SKIP_PATTERNS = [
-        "trackalacker.com",
         "twitter.com/intent",
         "t.co/",
         "x.com/i/",
-        "/status/",
     ]
     MAX_LABEL_LEN = 60
     results = []
@@ -429,7 +427,8 @@ def post_discord(tweet_data: dict, author_username: str):
             display = label if label else f"Link {i + 1}"
         link_parts.append(f"[{display}]({url})")
 
-    # Embed URL: first real link if available, else fall back to tweet
+    # Embed URL: first real link if available, always fall back to tweet URL
+    # (tweet_url is used as-is here — skip filter only applies inside extract_links_with_labels)
     first_url = labeled_links[0][1] if labeled_links else tweet_url
 
     lines = []
@@ -444,8 +443,10 @@ def post_discord(tweet_data: dict, author_username: str):
         "title": f"{alert_emoji} {category_label} — {alert_type.upper()}",
         "description": '\n'.join(lines),
         "color": color,
-        "url": first_url,
     }
+    # Only set url if we have a real one — an empty/missing url causes Discord 400
+    if first_url:
+        embed["url"] = first_url
 
     resp = requests.post(
         DISCORD_WEBHOOK,
