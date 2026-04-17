@@ -67,12 +67,8 @@ ALERT_COLORS = {
     "alert": 0x3498DB,
 }
 
-# ---------------------------------------------------------------------------
-# ALLOWLIST — tweet must match at least one of these patterns to be posted.
-# If none match, the tweet is silently dropped.
-# ---------------------------------------------------------------------------
 REQUIRED_SIGNALS = [
-    r'\$[\d,]+\.?\d*',               # price ($29.99, $1,299)
+    r'\$[\d,]+\.?\d*',
     r'\bin stock\b',
     r'\brestock\b',
     r'\bpreorder\b',
@@ -86,12 +82,7 @@ REQUIRED_SIGNALS = [
     r'\blive\s+now\b',
 ]
 
-# ---------------------------------------------------------------------------
-# BLOCKLIST — tweet is dropped if any phrase matches, regardless of signals.
-# Evaluated AFTER the allowlist so a price in a giveaway post still gets killed.
-# ---------------------------------------------------------------------------
 HARD_BLOCKLIST = [
-    # Giveaways / contests
     "giveaway",
     "give away",
     "enter to win",
@@ -106,7 +97,6 @@ HARD_BLOCKLIST = [
     "entering our",
     "🎁",
     "🏆",
-    # Engagement bait / polls / opinion posts
     "what's your favourite",
     "what is your favourite",
     "what's your favorite",
@@ -118,31 +108,26 @@ HARD_BLOCKLIST = [
     "which is better",
     "which do you prefer",
     "\bpoll\b",
-    # Community / fan content
     "shout-out sunday",
     "shoutout sunday",
     "built in pokopia",
     "spotted in pokopia",
     "custom cherry blossom",
-    "reddit u/",                     # user-generated content shares
-    # Meta / commentary posts
+    "reddit u/",
     "just another account",
     "fake news",
     "posting fake news",
     "reputable accounts",
-    # Non-card membership deals
     "sam's club membership",
     "sams club membership",
     "membership deal",
     "1-year membership",
-    "plus membership",               # Sam's Club plan name
-    "basic membership",              # Sam's Club plan name
-    # Hype / no-action posts
+    "plus membership",
+    "basic membership",
     "next week is going to be huge",
     "good luck if you're opening",
     "have a great weekend",
     "keep an eye out",
-    # Artist / influencer shoutouts
     "commission",
     "went viral",
     "joined twitter",
@@ -150,6 +135,9 @@ HARD_BLOCKLIST = [
 
 DEDUP_WINDOW_HOURS = 2
 seen_fingerprints: dict = {}
+
+# Module-level retry delay for exponential backoff on 429s
+retry_delay = 30
 
 logging.basicConfig(
     level=logging.INFO,
@@ -197,25 +185,18 @@ def set_rules():
     log.info(f"Stream rules set: {rule}")
 
 # ===========================================================================
-# Filtering — allowlist-first, then blocklist
+# Filtering
 # ===========================================================================
 
 def has_deal_signal(text: str) -> bool:
-    """Returns True only if the tweet contains at least one actionable deal signal."""
     text_lower = text.lower()
     return any(re.search(pattern, text_lower) for pattern in REQUIRED_SIGNALS)
 
 def is_blocked(text: str) -> bool:
-    """Returns True if the tweet matches any hard-blocklist phrase."""
     text_lower = text.lower()
     return any(re.search(phrase, text_lower) for phrase in HARD_BLOCKLIST)
 
 def should_post(text: str, author_username: str) -> bool:
-    """
-    Gate logic (order matters):
-      1. Must have at least one deal signal — kills engagement/fan/hype posts.
-      2. Must not match the blocklist — kills giveaways, membership deals, etc.
-    """
     if not has_deal_signal(text):
         log.info(f"Dropped (no deal signal): @{author_username} — {text[:80]}")
         return False
@@ -283,10 +264,9 @@ def detect_price(text: str) -> str:
 
 def extract_links_with_labels(text: str, entities: dict = None) -> list:
     """
-    Extracts actionable links from a tweet.
-    Primary: uses tweet entities.urls for real expanded/unwound URLs (not t.co).
-    Fallback: parses raw text if entities are absent or yield nothing usable.
-    Returns list of (label, url) tuples. Label may be None.
+    Extracts actionable links from tweet entities.
+    The expanded_url and unwound_url fields are returned automatically
+    inside tweet.fields=entities — no separate url.fields param needed.
     """
     SKIP_PATTERNS = [
         "twitter.com/intent",
@@ -301,7 +281,6 @@ def extract_links_with_labels(text: str, entities: dict = None) -> list:
 
     if entities and "urls" in entities:
         for url_obj in entities["urls"]:
-            # unwound_url follows all redirects; expanded_url resolves t.co
             final_url = (
                 url_obj.get("unwound_url")
                 or url_obj.get("expanded_url")
@@ -316,7 +295,7 @@ def extract_links_with_labels(text: str, entities: dict = None) -> list:
             log.debug(f"Entity link: {label!r} => {final_url}")
 
     if not results:
-        log.debug("No entity URLs found -- falling back to text parsing")
+        log.debug("No entity URLs found — falling back to text parsing")
         labeled_pattern = re.compile(
             r'-\s*([^:\n\-]{2,40}?)\s*:\s*(https?://\S+)', re.IGNORECASE
         )
@@ -337,17 +316,12 @@ def extract_links_with_labels(text: str, entities: dict = None) -> list:
     return results[:6]
 
 def extract_product(text: str) -> str:
-    # Remove URLs, hashtags, ad markers
     text = re.sub(r'https?://\S+', '', text)
     text = re.sub(r'#\w+', '', text)
     text = re.sub(r'#AD|#ad|\bAD\b', '', text, flags=re.IGNORECASE)
-
-    # Remove timestamps like "04/17/26 11:00 AM EDT" or "Apr 17, 2026 11:00AM"
     text = re.sub(r'\d{1,2}/\d{1,2}/\d{2,4}\s+\d{1,2}:\d{2}\s*[APap][Mm]\s*[A-Z]{2,4}', '', text)
     text = re.sub(r'\b[A-Z][a-z]{2}\s+\d{1,2},?\s+\d{4}\s+\d{1,2}:\d{2}\s*[APap][Mm]', '', text)
     text = re.sub(r'\d{1,2}:\d{2}\s*[APap][Mm]\s*[A-Z]{2,4}', '', text)
-
-    # Remove price references like "(Less than $XX)" or "Less than MSRP"
     text = re.sub(r'\(Less than[^)]*\)', '', text, flags=re.IGNORECASE)
     text = re.sub(r'Less than MSRP', '', text, flags=re.IGNORECASE)
 
@@ -366,14 +340,10 @@ def extract_product(text: str) -> str:
     for line in lines:
         if len(line) < 10:
             continue
-        # Skip pure price/number lines
         if re.match(r'^[\$\d\s\.,()+%-]+$', line):
             continue
-        # Skip lines that are just a store name
         if any(line.strip().lower() == s.lower() for s in list(STORE_MAP.values())):
             continue
-        # Skip lines that look like attribution: "BiggSports" style short single-word proper nouns
-        # followed by nothing else meaningful after timestamp removal
         if re.match(r'^[A-Z][A-Za-z0-9]+$', line) and len(line) < 20:
             continue
         product_lines.append(line)
@@ -390,7 +360,6 @@ def post_discord(tweet_data: dict, author_username: str):
     tweet_id  = tweet_data.get("id", "")
     tweet_url = f"https://x.com/{author_username}/status/{tweet_id}"
 
-    # Single gate — allowlist signal required, blocklist kills it
     if not should_post(text, author_username):
         return
 
@@ -409,16 +378,12 @@ def post_discord(tweet_data: dict, author_username: str):
         log.info(f"Duplicate suppressed: {alert_type.upper()} — {product[:40]} via @{author_username}")
         return
 
-    # Build meta line: store and/or price
     meta_parts = []
     if store:
         meta_parts.append(f"🏪 {store}")
     if price:
         meta_parts.append(f"💰 {price}")
 
-    # Build link line
-    # If only one link: show as "View Deal"
-    # If multiple: label with page title if available, else "Link 1", "Link 2", etc.
     link_parts = []
     for i, (label, url) in enumerate(labeled_links):
         if len(labeled_links) == 1:
@@ -427,8 +392,6 @@ def post_discord(tweet_data: dict, author_username: str):
             display = label if label else f"Link {i + 1}"
         link_parts.append(f"[{display}]({url})")
 
-    # Embed URL: first real link if available, always fall back to tweet URL
-    # (tweet_url is used as-is here — skip filter only applies inside extract_links_with_labels)
     first_url = labeled_links[0][1] if labeled_links else tweet_url
 
     lines = []
@@ -444,7 +407,6 @@ def post_discord(tweet_data: dict, author_username: str):
         "description": '\n'.join(lines),
         "color": color,
     }
-    # Only set url if we have a real one — an empty/missing url causes Discord 400
     if first_url:
         embed["url"] = first_url
 
@@ -472,6 +434,7 @@ def get_author_username(author_id: str) -> str:
     return "unknown"
 
 def stream():
+    global retry_delay
     log.info("Connecting to stream...")
     with requests.get(
         "https://api.twitter.com/2/tweets/search/stream",
@@ -480,15 +443,22 @@ def stream():
             "tweet.fields": "created_at,author_id,text,entities",
             "expansions":   "author_id,attachments.media_keys",
             "user.fields":  "username",
-            "url.fields":   "expanded_url,unwound_url,title,display_url",
         },
         stream=True,
         timeout=90,
     ) as resp:
+        if resp.status_code == 429:
+            log.warning(f"Rate limited (429) — backing off {retry_delay}s before retry...")
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 900)  # cap at 15 minutes
+            return
+
         if not resp.ok:
             log.error(f"Stream error {resp.status_code}: {resp.text}")
             return
 
+        # Successful connection — reset backoff
+        retry_delay = 30
         log.info("Stream connected — listening for tweets...")
 
         for line in resp.iter_lines():
@@ -520,9 +490,10 @@ if __name__ == "__main__":
             stream()
         except requests.exceptions.Timeout:
             log.warning("Stream timed out — reconnecting in 5s...")
+            time.sleep(5)
         except requests.exceptions.ConnectionError:
             log.warning("Connection dropped — reconnecting in 5s...")
+            time.sleep(5)
         except Exception as e:
             log.error(f"Unexpected error: {e} — reconnecting in 10s...")
-            time.sleep(5)
-        time.sleep(5)
+            time.sleep(10)
