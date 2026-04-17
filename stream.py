@@ -281,39 +281,58 @@ def detect_price(text: str) -> str:
     match = re.search(r'\$[\d,]+\.?\d*', text)
     return match.group(0) if match else None
 
-def extract_links_with_labels(text: str) -> list:
+def extract_links_with_labels(text: str, entities: dict = None) -> list:
     """
-    Returns a list of (label, url) tuples.
-    Handles patterns like:
-      - Hobby Box: https://...
-      - Hobby Box: https://...
-      Raw URLs with no label get label=None.
-    """
-    skip = ["trackalacker.com", "twitter.com/intent", "t.co/"]
+    Extracts actionable links from a tweet.
 
-    # Match optional leading dash + label + colon + URL
-    labeled_pattern = re.compile(
-        r'-\s*([^:\n\-]{2,40}?)\s*:\s*(https?://\S+)', re.IGNORECASE
-    )
+    Primary path: uses tweet entities.urls, which contains real expanded URLs
+    (not t.co short links). Falls back to parsing raw text if entities are
+    absent or yield nothing usable.
+
+    Returns a list of (label, url) tuples. Label may be None if no title
+    or display_url is available.
+    """
+    SKIP_DOMAINS = ["trackalacker.com", "twitter.com/intent", "t.co/", "x.com/"]
+    MAX_LABEL_LEN = 60
     results = []
-    matched_urls = set()
 
-    for m in labeled_pattern.finditer(text):
-        label = m.group(1).strip().title()
-        url   = m.group(2).rstrip('.,)')
-        if any(s in url for s in skip):
-            continue
-        results.append((label, url))
-        matched_urls.add(url)
+    # --- Primary: use tweet entities for real expanded/unwound URLs ---
+    if entities and "urls" in entities:
+        for url_obj in entities["urls"]:
+            # Prefer unwound_url (fully follows redirects), then expanded_url
+            final_url = url_obj.get("unwound_url") or url_obj.get("expanded_url", "")
+            if not final_url or any(s in final_url for s in SKIP_DOMAINS):
+                continue
 
-    # Pick up any remaining raw URLs not already captured
-    for url in re.findall(r'https?://\S+', text):
-        url = url.rstrip('.,)')
-        if url in matched_urls:
-            continue
-        if any(s in url for s in skip):
-            continue
-        results.append((None, url))
+            # Best label priority: page title > display_url > None
+            label = url_obj.get("title") or url_obj.get("display_url") or None
+            if label and len(label) > MAX_LABEL_LEN:
+                label = label[:MAX_LABEL_LEN - 3] + "..."
+
+            results.append((label, final_url))
+            log.debug(f"Entity link: {label!r} → {final_url}")
+
+    # --- Fallback: parse raw text (catches edge cases, older API responses) ---
+    if not results:
+        log.debug("No entity URLs found — falling back to text parsing")
+        labeled_pattern = re.compile(
+            r'-\s*([^:\n\-]{2,40}?)\s*:\s*(https?://\S+)', re.IGNORECASE
+        )
+        matched_urls = set()
+
+        for m in labeled_pattern.finditer(text):
+            label = m.group(1).strip().title()
+            url   = m.group(2).rstrip('.,)')
+            if any(s in url for s in SKIP_DOMAINS):
+                continue
+            results.append((label, url))
+            matched_urls.add(url)
+
+        for url in re.findall(r'https?://\S+', text):
+            url = url.rstrip('.,)')
+            if url in matched_urls or any(s in url for s in SKIP_DOMAINS):
+                continue
+            results.append((None, url))
 
     return results[:6]
 
@@ -351,6 +370,7 @@ def extract_product(text: str) -> str:
 
 def post_discord(tweet_data: dict, author_username: str):
     text      = tweet_data.get("text", "")
+    entities  = tweet_data.get("entities", {})
     tweet_id  = tweet_data.get("id", "")
     tweet_url = f"https://x.com/{author_username}/status/{tweet_id}"
 
@@ -362,7 +382,7 @@ def post_discord(tweet_data: dict, author_username: str):
     category       = detect_category(text)
     store          = detect_store(text)
     price          = detect_price(text)
-    labeled_links  = extract_links_with_labels(text)
+    labeled_links  = extract_links_with_labels(text, entities)
     product        = extract_product(text)
     color          = ALERT_COLORS.get(alert_type, 0x3498DB)
     alert_emoji    = ALERT_EMOJIS.get(alert_type, "📣")
@@ -380,15 +400,18 @@ def post_discord(tweet_data: dict, author_username: str):
     if price:
         meta_parts.append(f"💰 {price}")
 
-    # Build link line: use labels where available, fallback to generic
+    # Build link line
+    # If only one link: show as "View Deal"
+    # If multiple: label with page title if available, else "Link 1", "Link 2", etc.
     link_parts = []
     for i, (label, url) in enumerate(labeled_links):
-        if label:
-            link_parts.append(f"[{label}]({url})")
+        if len(labeled_links) == 1:
+            display = label if label else "View Deal"
         else:
-            display = "View Deal" if i == 0 else f"Alt Link {i + 1}"
-            link_parts.append(f"[{display}]({url})")
+            display = label if label else f"Link {i + 1}"
+        link_parts.append(f"[{display}]({url})")
 
+    # Embed URL: first real link if available, else fall back to tweet
     first_url = labeled_links[0][1] if labeled_links else tweet_url
 
     lines = []
@@ -399,11 +422,17 @@ def post_discord(tweet_data: dict, author_username: str):
     if link_parts:
         lines.append("\n🔗 " + "  ·  ".join(link_parts))
 
+    # Always append tweet source link at the bottom
+    lines.append(f"\n🐦 [View Tweet]({tweet_url})")
+
     embed = {
         "title": f"{alert_emoji} {category_label} — {alert_type.upper()}",
         "description": '\n'.join(lines),
         "color": color,
         "url": first_url,
+        "footer": {
+            "text": f"via @{author_username}"
+        },
     }
 
     resp = requests.post(
