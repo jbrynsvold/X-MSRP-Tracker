@@ -284,68 +284,80 @@ def detect_price(text: str) -> str:
 def extract_links_with_labels(text: str, entities: dict = None) -> list:
     """
     Extracts actionable links from a tweet.
-
-    Primary path: uses tweet entities.urls, which contains real expanded URLs
-    (not t.co short links). Falls back to parsing raw text if entities are
-    absent or yield nothing usable.
-
-    Returns a list of (label, url) tuples. Label may be None if no title
-    or display_url is available.
+    Primary: uses tweet entities.urls for real expanded/unwound URLs (not t.co).
+    Fallback: parses raw text if entities are absent or yield nothing usable.
+    Returns list of (label, url) tuples. Label may be None.
     """
-    SKIP_DOMAINS = ["trackalacker.com", "twitter.com/intent", "t.co/", "x.com/"]
+    SKIP_PATTERNS = [
+        "trackalacker.com",
+        "twitter.com/intent",
+        "t.co/",
+        "x.com/i/",
+        "/status/",
+    ]
     MAX_LABEL_LEN = 60
     results = []
 
-    # --- Primary: use tweet entities for real expanded/unwound URLs ---
+    def should_skip(url):
+        return any(s in url for s in SKIP_PATTERNS)
+
     if entities and "urls" in entities:
         for url_obj in entities["urls"]:
-            # Prefer unwound_url (fully follows redirects), then expanded_url
-            final_url = url_obj.get("unwound_url") or url_obj.get("expanded_url", "")
-            if not final_url or any(s in final_url for s in SKIP_DOMAINS):
+            # unwound_url follows all redirects; expanded_url resolves t.co
+            final_url = (
+                url_obj.get("unwound_url")
+                or url_obj.get("expanded_url")
+                or ""
+            )
+            if not final_url or should_skip(final_url):
                 continue
-
-            # Best label priority: page title > display_url > None
             label = url_obj.get("title") or url_obj.get("display_url") or None
             if label and len(label) > MAX_LABEL_LEN:
                 label = label[:MAX_LABEL_LEN - 3] + "..."
-
             results.append((label, final_url))
-            log.debug(f"Entity link: {label!r} → {final_url}")
+            log.debug(f"Entity link: {label!r} => {final_url}")
 
-    # --- Fallback: parse raw text (catches edge cases, older API responses) ---
     if not results:
-        log.debug("No entity URLs found — falling back to text parsing")
+        log.debug("No entity URLs found -- falling back to text parsing")
         labeled_pattern = re.compile(
             r'-\s*([^:\n\-]{2,40}?)\s*:\s*(https?://\S+)', re.IGNORECASE
         )
         matched_urls = set()
-
         for m in labeled_pattern.finditer(text):
             label = m.group(1).strip().title()
             url   = m.group(2).rstrip('.,)')
-            if any(s in url for s in SKIP_DOMAINS):
+            if should_skip(url):
                 continue
             results.append((label, url))
             matched_urls.add(url)
-
         for url in re.findall(r'https?://\S+', text):
             url = url.rstrip('.,)')
-            if url in matched_urls or any(s in url for s in SKIP_DOMAINS):
+            if url in matched_urls or should_skip(url):
                 continue
             results.append((None, url))
 
     return results[:6]
 
 def extract_product(text: str) -> str:
-    text = re.sub(r'#\w+', '', text)
+    # Remove URLs, hashtags, ad markers
     text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'#\w+', '', text)
     text = re.sub(r'#AD|#ad|\bAD\b', '', text, flags=re.IGNORECASE)
+
+    # Remove timestamps like "04/17/26 11:00 AM EDT" or "Apr 17, 2026 11:00AM"
+    text = re.sub(r'\d{1,2}/\d{1,2}/\d{2,4}\s+\d{1,2}:\d{2}\s*[APap][Mm]\s*[A-Z]{2,4}', '', text)
+    text = re.sub(r'\b[A-Z][a-z]{2}\s+\d{1,2},?\s+\d{4}\s+\d{1,2}:\d{2}\s*[APap][Mm]', '', text)
+    text = re.sub(r'\d{1,2}:\d{2}\s*[APap][Mm]\s*[A-Z]{2,4}', '', text)
+
+    # Remove price references like "(Less than $XX)" or "Less than MSRP"
+    text = re.sub(r'\(Less than[^)]*\)', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'Less than MSRP', '', text, flags=re.IGNORECASE)
 
     noise = [
         "IN STOCK ALERT", "RESTOCK", "IN STOCK", "Sold by", "As of",
         "Follow", "Bookmark", "Save this", "We'll tweet", "We'll post",
         "follow with notifications", "alert if they drop",
-        "historically restocks", "MSRP", "Less than MSRP",
+        "historically restocks", "MSRP",
         "🛎️", "🚨", "📣", "✅", "💰", "🏪", "📦", "🔗", "📡",
     ]
     for n in noise:
@@ -356,9 +368,15 @@ def extract_product(text: str) -> str:
     for line in lines:
         if len(line) < 10:
             continue
-        if re.match(r'^[\$\d\s\.]+$', line):
+        # Skip pure price/number lines
+        if re.match(r'^[\$\d\s\.,()+%-]+$', line):
             continue
+        # Skip lines that are just a store name
         if any(line.strip().lower() == s.lower() for s in list(STORE_MAP.values())):
+            continue
+        # Skip lines that look like attribution: "BiggSports" style short single-word proper nouns
+        # followed by nothing else meaningful after timestamp removal
+        if re.match(r'^[A-Z][A-Za-z0-9]+$', line) and len(line) < 20:
             continue
         product_lines.append(line)
 
@@ -422,17 +440,11 @@ def post_discord(tweet_data: dict, author_username: str):
     if link_parts:
         lines.append("\n🔗 " + "  ·  ".join(link_parts))
 
-    # Always append tweet source link at the bottom
-    lines.append(f"\n🐦 [View Tweet]({tweet_url})")
-
     embed = {
         "title": f"{alert_emoji} {category_label} — {alert_type.upper()}",
         "description": '\n'.join(lines),
         "color": color,
         "url": first_url,
-        "footer": {
-            "text": f"via @{author_username}"
-        },
     }
 
     resp = requests.post(
@@ -465,8 +477,9 @@ def stream():
         headers={"Authorization": f"Bearer {BEARER_TOKEN}"},
         params={
             "tweet.fields": "created_at,author_id,text,entities",
-            "expansions":   "author_id",
+            "expansions":   "author_id,attachments.media_keys",
             "user.fields":  "username",
+            "url.fields":   "expanded_url,unwound_url,title,display_url",
         },
         stream=True,
         timeout=90,
