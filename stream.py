@@ -423,7 +423,6 @@ def post_discord(tweet_data: dict, author_username: str):
                 "url":         url,
                 "description": '\n'.join(lines),
                 "color":       color,
-                "footer":      {"text": f"via @{author_username}"},
             })
     else:
         product = extract_product(text)
@@ -436,7 +435,6 @@ def post_discord(tweet_data: dict, author_username: str):
             "url":         tweet_url,
             "description": '\n'.join(lines),
             "color":       color,
-            "footer":      {"text": f"via @{author_username}"},
         })
 
     resp = requests.post(
