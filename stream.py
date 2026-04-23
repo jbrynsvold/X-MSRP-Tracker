@@ -131,6 +131,10 @@ HARD_BLOCKLIST = [
     "commission",
     "went viral",
     "joined twitter",
+    "enter by",
+    " draw ",
+    "raffle",
+    "enter now for",
 ]
 
 DEDUP_WINDOW_HOURS = 2
@@ -272,6 +276,8 @@ def extract_links_with_labels(text: str, entities: dict = None) -> list:
         "twitter.com/intent",
         "t.co/",
         "x.com/i/",
+        "pic.x.com",
+        "pic.twitter.com",
     ]
     MAX_LABEL_LEN = 60
     results = []
@@ -288,9 +294,8 @@ def extract_links_with_labels(text: str, entities: dict = None) -> list:
             )
             if not final_url or should_skip(final_url):
                 continue
-            label = url_obj.get("title") or url_obj.get("display_url") or None
-            if label and len(label) > MAX_LABEL_LEN:
-                label = label[:MAX_LABEL_LEN - 3] + "..."
+            raw = url_obj.get("title") or url_obj.get("display_url") or None
+            label = clean_link_title(raw) or raw
             results.append((label, final_url))
             log.debug(f"Entity link: {label!r} => {final_url}")
 
@@ -351,8 +356,31 @@ def extract_product(text: str) -> str:
     return '\n'.join(product_lines[:3]) if product_lines else text[:200].strip()
 
 # ===========================================================================
+# Clean Link Title
+# ===========================================================================
+
+def clean_link_title(title: str) -> str:
+    if not title:
+        return None
+    noise_patterns = [
+        r'\s*[-|]\s*walmart.*$',
+        r'\s*[-|]\s*amazon.*$',
+        r'\s*[-|]\s*target.*$',
+        r'\s*in stock.*$',
+        r'\s*\|\s*.*$',
+    ]
+    cleaned = title
+    for pattern in noise_patterns:
+        cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE).strip()
+    if len(cleaned) < 8:
+        return None
+    return cleaned[:80]
+
+# ===========================================================================
 # Discord posting
 # ===========================================================================
+
+MAX_EMBEDS_PER_TWEET = 3
 
 def post_discord(tweet_data: dict, author_username: str):
     text      = tweet_data.get("text", "")
@@ -368,57 +396,58 @@ def post_discord(tweet_data: dict, author_username: str):
     store          = detect_store(text)
     price          = detect_price(text)
     labeled_links  = extract_links_with_labels(text, entities)
-    product        = extract_product(text)
     color          = ALERT_COLORS.get(alert_type, 0x3498DB)
     alert_emoji    = ALERT_EMOJIS.get(alert_type, "📣")
     category_label = CATEGORY_EMOJIS.get(category, "🃏 Trading Cards")
 
-    fingerprint = make_fingerprint(alert_type, store, product)
+    fingerprint = make_fingerprint(alert_type, store, extract_product(text))
     if is_duplicate(fingerprint):
-        log.info(f"Duplicate suppressed: {alert_type.upper()} — {product[:40]} via @{author_username}")
+        log.info(f"Duplicate suppressed: @{author_username}")
         return
 
     meta_parts = []
-    if store:
-        meta_parts.append(f"🏪 {store}")
-    if price:
-        meta_parts.append(f"💰 {price}")
+    if store:  meta_parts.append(f"🏪 {store}")
+    if price:  meta_parts.append(f"💰 {price}")
+    meta_line = "  ·  ".join(meta_parts)
 
-    link_parts = []
-    for i, (label, url) in enumerate(labeled_links):
-        if len(labeled_links) == 1:
-            display = label if label else "View Deal"
-        else:
-            display = label if label else f"Link {i + 1}"
-        link_parts.append(f"[{display}]({url})")
+    embeds = []
 
-    first_url = labeled_links[0][1] if labeled_links else tweet_url
-
-    lines = []
-    if product:
-        lines.append(f"📦 {product}")
-    if meta_parts:
-        lines.append("  ·  ".join(meta_parts))
-    if link_parts:
-        lines.append("\n🔗 " + "  ·  ".join(link_parts))
-
-    embed = {
-        "title": f"{alert_emoji} {category_label} — {alert_type.upper()}",
-        "description": '\n'.join(lines),
-        "color": color,
-    }
-    if first_url:
-        embed["url"] = first_url
+    if labeled_links:
+        for label, url in labeled_links[:MAX_EMBEDS_PER_TWEET]:
+            product = clean_link_title(label) or extract_product(text)
+            lines = []
+            if product:   lines.append(f"📦 {product}")
+            if meta_line: lines.append(meta_line)
+            embeds.append({
+                "title":       f"{alert_emoji} {category_label} — {alert_type.upper()}",
+                "url":         url,
+                "description": '\n'.join(lines),
+                "color":       color,
+                "footer":      {"text": f"via @{author_username}"},
+            })
+    else:
+        product = extract_product(text)
+        lines = []
+        if product:   lines.append(f"📦 {product}")
+        if meta_line: lines.append(meta_line)
+        lines.append(f"🔗 [View Tweet]({tweet_url})")
+        embeds.append({
+            "title":       f"{alert_emoji} {category_label} — {alert_type.upper()}",
+            "url":         tweet_url,
+            "description": '\n'.join(lines),
+            "color":       color,
+            "footer":      {"text": f"via @{author_username}"},
+        })
 
     resp = requests.post(
         DISCORD_WEBHOOK,
-        json={"embeds": [embed]},
+        json={"embeds": embeds},
         headers={"Content-Type": "application/json"},
     )
     if not resp.ok:
         log.error(f"Discord error {resp.status_code}: {resp.text}")
     else:
-        log.info(f"Posted: {alert_type.upper()} — {category_label} via @{author_username}")
+        log.info(f"Posted {len(embeds)} embed(s): {alert_type.upper()} — {category_label} via @{author_username}")
 
 # ===========================================================================
 # Stream
