@@ -262,7 +262,19 @@ def detect_store(text: str) -> str:
             return name
     return None
 
-def detect_price(text: str) -> str:
+def detect_price(text: str, context: str = None) -> str:
+    # If context provided, look for price nearest to that text first
+    if context:
+        # Find all prices with their positions
+        prices = [(m.group(0), m.start()) for m in re.finditer(r'\$[\d,]+\.?\d*', text)]
+        if prices:
+            # Find position of context in text
+            ctx_pos = text.lower().find(context[:20].lower())
+            if ctx_pos >= 0:
+                # Return price closest to context position
+                closest = min(prices, key=lambda p: abs(p[1] - ctx_pos))
+                return closest[0]
+    # Default: first price in text
     match = re.search(r'\$[\d,]+\.?\d*', text)
     return match.group(0) if match else None
 
@@ -276,6 +288,7 @@ def extract_links_with_labels(text: str, entities: dict = None) -> list:
         "twitter.com/intent",
         "t.co/",
         "x.com/i/",
+        "/photo/",
         "pic.x.com",
         "pic.twitter.com",
     ]
@@ -396,7 +409,6 @@ def post_discord(tweet_data: dict, author_username: str):
     alert_type     = detect_alert_type(text)
     category       = detect_category(text)
     store          = detect_store(text)
-    price          = detect_price(text)
     labeled_links  = extract_links_with_labels(text, entities)
     color          = ALERT_COLORS.get(alert_type, 0x3498DB)
     alert_emoji    = ALERT_EMOJIS.get(alert_type, "📣")
@@ -407,16 +419,16 @@ def post_discord(tweet_data: dict, author_username: str):
         log.info(f"Duplicate suppressed: @{author_username}")
         return
 
-    meta_parts = []
-    if store:  meta_parts.append(f"🏪 {store}")
-    if price:  meta_parts.append(f"💰 {price}")
-    meta_line = "  ·  ".join(meta_parts)
-
     embeds = []
 
     if labeled_links:
         for label, url in labeled_links[:MAX_EMBEDS_PER_TWEET]:
             product = clean_link_title(label) or extract_product(text)
+            price = detect_price(text, context=product)
+            meta_parts = []
+            if store:  meta_parts.append(f"🏪 {store}")
+            if price:  meta_parts.append(f"💰 {price}")
+            meta_line = "  ·  ".join(meta_parts)
             lines = []
             if product:   lines.append(f"📦 {product}")
             if meta_line: lines.append(meta_line)
@@ -428,6 +440,11 @@ def post_discord(tweet_data: dict, author_username: str):
             })
     else:
         product = extract_product(text)
+        price = detect_price(text)
+        meta_parts = []
+        if store:  meta_parts.append(f"🏪 {store}")
+        if price:  meta_parts.append(f"💰 {price}")
+        meta_line = "  ·  ".join(meta_parts)
         lines = []
         if product:   lines.append(f"📦 {product}")
         if meta_line: lines.append(meta_line)
