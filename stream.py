@@ -292,8 +292,9 @@ def extract_links_with_labels(text: str, entities: dict = None) -> list:
                 or url_obj.get("expanded_url")
                 or ""
             )
-            if not final_url or should_skip(final_url):
-                continue
+            expanded = url_obj.get("expanded_url", "")
+            if not final_url or should_skip(final_url) or should_skip(expanded):
+    continue
             raw = url_obj.get("title") or url_obj.get("display_url") or None
             label = clean_link_title(raw) or raw
             results.append((label, final_url))
@@ -322,6 +323,7 @@ def extract_links_with_labels(text: str, entities: dict = None) -> list:
 
 def extract_product(text: str) -> str:
     text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'pic\.(x|twitter)\.com/\S+', '', text, flags=re.IGNORECASE)
     text = re.sub(r'#\w+', '', text)
     text = re.sub(r'#AD|#ad|\bAD\b', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\d{1,2}/\d{1,2}/\d{2,4}\s+\d{1,2}:\d{2}\s*[APap][Mm]\s*[A-Z]{2,4}', '', text)
