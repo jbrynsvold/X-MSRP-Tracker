@@ -293,7 +293,7 @@ def extract_links_with_labels(text: str, entities: dict = None) -> list:
                 or ""
             )
             expanded = url_obj.get("expanded_url", "")
-            if not final_url or should_skip(final_url) or should_skip(expanded):
+    if not final_url or should_skip(final_url) or should_skip(expanded):
     continue
             raw = url_obj.get("title") or url_obj.get("display_url") or None
             label = clean_link_title(raw) or raw
