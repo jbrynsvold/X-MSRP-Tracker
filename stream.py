@@ -243,7 +243,7 @@ def detect_alert_type(text: str) -> str:
 
 def detect_category(text: str) -> str:
     text_lower = text.lower()
-    if any(w in text_lower for w in ["pokemon", "pokémon", "tcg", "poke"]):
+    if any(w in text_lower for w in ["pokemon", "pokémon", "poke"]):
         return "pokemon"
     if any(w in text_lower for w in ["football", "nfl"]):
         return "football"
@@ -391,11 +391,45 @@ def clean_link_title(title: str) -> str:
         return None
     return cleaned[:80]
 
+def parse_product_lines(text: str) -> list:
+    """
+    Splits tweet into product-description lines, one per link.
+    Strips noise, URLs, hashtags, stock info, and short lines.
+    Returns a list of clean product strings in order of appearance.
+    """
+    # Remove URLs, hashtags, stock counts, timestamps
+    cleaned = re.sub(r'https?://\S+', '', text)
+    cleaned = re.sub(r'pic\.(x|twitter)\.com/\S+', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'#\w+', '', cleaned)
+    cleaned = re.sub(r'\(Stock:\s*[\d\.]+[kKmM]?\)', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'Stock:\s*[\d\.]+[kKmM]?', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'#AD|#ad|\bAD\b', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\$[\d,]+\.?\d*', '', cleaned)
+
+    noise = [
+        "IN STOCK ALERT", "RESTOCK", "IN STOCK", "Sold by", "As of",
+        "Follow", "Bookmark", "Save this", "We'll tweet", "We'll post",
+        "Walmart + not needed", "Walmart+ not needed",
+        "Good luck", "Limit should be",
+        "🛎️", "🚨", "📣", "✅", "💰", "🏪", "📦", "🔗", "📡", "☑️",
+    ]
+    for n in noise:
+        cleaned = re.sub(re.escape(n), '', cleaned, flags=re.IGNORECASE)
+
+    lines = []
+    for line in cleaned.split('\n'):
+        line = line.strip(' -•·')
+        if len(line) < 8:
+            continue
+        if re.match(r'^[\$\d\s\.,()+%-]+$', line):
+            continue
+        lines.append(line)
+
+    return lines
+
 # ===========================================================================
 # Discord posting
 # ===========================================================================
-
-MAX_EMBEDS_PER_TWEET = 3
 
 def post_discord(tweet_data: dict, author_username: str):
     text      = tweet_data.get("text", "")
@@ -409,62 +443,101 @@ def post_discord(tweet_data: dict, author_username: str):
     alert_type     = detect_alert_type(text)
     category       = detect_category(text)
     store          = detect_store(text)
-    labeled_links  = extract_links_with_labels(text, entities)
     color          = ALERT_COLORS.get(alert_type, 0x3498DB)
     alert_emoji    = ALERT_EMOJIS.get(alert_type, "📣")
     category_label = CATEGORY_EMOJIS.get(category, "🃏 Trading Cards")
 
-    fingerprint = make_fingerprint(alert_type, store, extract_product(text))
-    if is_duplicate(fingerprint):
-        log.info(f"Duplicate suppressed: @{author_username}")
-        return
-
-    embeds = []
+    labeled_links = extract_links_with_labels(text, entities)
 
     if labeled_links:
-        for label, url in labeled_links[:MAX_EMBEDS_PER_TWEET]:
-            product = clean_link_title(label) or extract_product(text)
+        # Parse tweet lines to associate product descriptions with links
+        product_lines = parse_product_lines(text)
+        alerts_sent = 0
+
+        for i, (label, url) in enumerate(labeled_links[:6]):
+            product = clean_link_title(label)
+            if not product and i < len(product_lines):
+                product = product_lines[i]
+            if not product:
+                product = extract_product(text)
+
+            # Detect category from label too, since link titles often have product names
+            link_category = detect_category(label or "") if label else category
+            effective_category = link_category if link_category != "trading cards" else category
+            category_label = CATEGORY_EMOJIS.get(effective_category, "🃏 Trading Cards")
+
             price = detect_price(text, context=product)
+
+            # Dedup per individual product
+            fingerprint = make_fingerprint(alert_type, store, product)
+            if is_duplicate(fingerprint):
+                log.info(f"Duplicate suppressed: @{author_username} — {product[:40]}")
+                continue
+
             meta_parts = []
-            if store:  meta_parts.append(f"🏪 {store}")
-            if price:  meta_parts.append(f"💰 {price}")
+            if store: meta_parts.append(f"🏪 {store}")
+            if price: meta_parts.append(f"💰 {price}")
             meta_line = "  ·  ".join(meta_parts)
+
             lines = []
             if product:   lines.append(f"📦 {product}")
             if meta_line: lines.append(meta_line)
-            embeds.append({
+
+            embed = {
                 "title":       f"{alert_emoji} {category_label} — {alert_type.upper()}",
                 "url":         url,
                 "description": '\n'.join(lines),
                 "color":       color,
-            })
+            }
+
+            resp = requests.post(
+                DISCORD_WEBHOOK,
+                json={"embeds": [embed]},
+                headers={"Content-Type": "application/json"},
+            )
+            if not resp.ok:
+                log.error(f"Discord error {resp.status_code}: {resp.text}")
+            else:
+                alerts_sent += 1
+                log.info(f"Posted embed {alerts_sent}: {alert_type.upper()} — {product[:40]}")
+            time.sleep(0.3)  # avoid Discord rate limit
+
     else:
+        # No links — single embed pointing to tweet
         product = extract_product(text)
-        price = detect_price(text)
+        price   = detect_price(text)
+
+        fingerprint = make_fingerprint(alert_type, store, product)
+        if is_duplicate(fingerprint):
+            log.info(f"Duplicate suppressed: @{author_username}")
+            return
+
         meta_parts = []
-        if store:  meta_parts.append(f"🏪 {store}")
-        if price:  meta_parts.append(f"💰 {price}")
+        if store: meta_parts.append(f"🏪 {store}")
+        if price: meta_parts.append(f"💰 {price}")
         meta_line = "  ·  ".join(meta_parts)
+
         lines = []
         if product:   lines.append(f"📦 {product}")
         if meta_line: lines.append(meta_line)
         lines.append(f"🔗 [View Tweet]({tweet_url})")
-        embeds.append({
+
+        embed = {
             "title":       f"{alert_emoji} {category_label} — {alert_type.upper()}",
             "url":         tweet_url,
             "description": '\n'.join(lines),
             "color":       color,
-        })
+        }
 
-    resp = requests.post(
-        DISCORD_WEBHOOK,
-        json={"embeds": embeds},
-        headers={"Content-Type": "application/json"},
-    )
-    if not resp.ok:
-        log.error(f"Discord error {resp.status_code}: {resp.text}")
-    else:
-        log.info(f"Posted {len(embeds)} embed(s): {alert_type.upper()} — {category_label} via @{author_username}")
+        resp = requests.post(
+            DISCORD_WEBHOOK,
+            json={"embeds": [embed]},
+            headers={"Content-Type": "application/json"},
+        )
+        if not resp.ok:
+            log.error(f"Discord error {resp.status_code}: {resp.text}")
+        else:
+            log.info(f"Posted: {alert_type.upper()} — {category_label} via @{author_username}")
 
 # ===========================================================================
 # Stream
