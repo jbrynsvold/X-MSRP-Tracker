@@ -7,6 +7,7 @@ import re
 import hashlib
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from supabase import create_client, Client as SupabaseClient
 
 load_dotenv()
 
@@ -413,8 +414,6 @@ def parse_product_lines(text: str) -> list:
 # ===========================================================================
 # Sealed product price lookup
 # ===========================================================================
-
-from supabase import create_client, Client as SupabaseClient
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
