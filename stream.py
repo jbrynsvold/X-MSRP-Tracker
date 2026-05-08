@@ -263,27 +263,17 @@ def detect_store(text: str) -> str:
     return None
 
 def detect_price(text: str, context: str = None) -> str:
-    # If context provided, look for price nearest to that text first
     if context:
-        # Find all prices with their positions
         prices = [(m.group(0), m.start()) for m in re.finditer(r'\$[\d,]+\.?\d*', text)]
         if prices:
-            # Find position of context in text
             ctx_pos = text.lower().find(context[:20].lower())
             if ctx_pos >= 0:
-                # Return price closest to context position
                 closest = min(prices, key=lambda p: abs(p[1] - ctx_pos))
                 return closest[0]
-    # Default: first price in text
     match = re.search(r'\$[\d,]+\.?\d*', text)
     return match.group(0) if match else None
 
 def extract_links_with_labels(text: str, entities: dict = None) -> list:
-    """
-    Extracts actionable links from tweet entities.
-    The expanded_url and unwound_url fields are returned automatically
-    inside tweet.fields=entities — no separate url.fields param needed.
-    """
     SKIP_PATTERNS = [
         "twitter.com/intent",
         "t.co/",
@@ -292,7 +282,6 @@ def extract_links_with_labels(text: str, entities: dict = None) -> list:
         "pic.x.com",
         "pic.twitter.com",
     ]
-    MAX_LABEL_LEN = 60
     results = []
 
     def should_skip(url):
@@ -392,12 +381,6 @@ def clean_link_title(title: str) -> str:
     return cleaned[:80]
 
 def parse_product_lines(text: str) -> list:
-    """
-    Splits tweet into product-description lines, one per link.
-    Strips noise, URLs, hashtags, stock info, and short lines.
-    Returns a list of clean product strings in order of appearance.
-    """
-    # Remove URLs, hashtags, stock counts, timestamps
     cleaned = re.sub(r'https?://\S+', '', text)
     cleaned = re.sub(r'pic\.(x|twitter)\.com/\S+', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'#\w+', '', cleaned)
@@ -428,6 +411,233 @@ def parse_product_lines(text: str) -> list:
     return lines
 
 # ===========================================================================
+# Sealed product price lookup
+# ===========================================================================
+
+from supabase import create_client, Client as SupabaseClient
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase_client: SupabaseClient = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+_sealed_tcg_cache:       list  = []
+_sealed_scp_cache:       list  = []
+_sealed_cache_loaded_at: float = 0.0
+SEALED_CACHE_TTL = 86400  # reload once per day
+
+SEALED_NOISE = {
+    "the", "and", "for", "with", "of", "a", "an",
+    "trading", "card", "cards", "game",
+    "new", "official", "includes", "receive", "random",
+    "pokemon", "tcg",
+}
+
+PRODUCT_TYPE_TOKENS = {
+    "hobby", "blaster", "retail", "hanger", "mega", "jumbo",
+    "collector", "value", "cello", "gravity", "fat",
+    "booster", "bundle", "elite", "trainer", "tin",
+}
+
+def tokenize_sealed(text: str) -> set:
+    return {
+        w.lower() for w in re.split(r'[\W_]+', text)
+        if len(w) >= 3 and w.lower() not in SEALED_NOISE
+    }
+
+def extract_year(text: str):
+    m = re.search(r'\b(20\d{2})\b', text)
+    return int(m.group(1)) if m else None
+
+def load_sealed_cache():
+    global _sealed_tcg_cache, _sealed_scp_cache, _sealed_cache_loaded_at
+    now = time.time()
+    if now - _sealed_cache_loaded_at < SEALED_CACHE_TTL:
+        return
+
+    # BUG FIX 1: TCGCSV cache queries tcgcsv_products, not scp_prices
+    try:
+        result = supabase_client.table("tcgcsv_products") \
+            .select("product_id, clean_name") \
+            .eq("is_sealed", True) \
+            .eq("category_id", 3) \
+            .execute()
+        _sealed_tcg_cache = result.data or []
+        log.info(f"Sealed cache: loaded {len(_sealed_tcg_cache)} TCGCSV Pokemon products")
+    except Exception as e:
+        log.error(f"Failed to load TCGCSV sealed cache: {e}")
+
+    # SCP — sports sealed with prices, filtered to real sealed product types only
+    try:
+        result = supabase_client.table("scp_prices") \
+            .select("product_name, product, brand, year, sport, loose_price") \
+            .eq("is_sealed", True) \
+            .not_.is_("loose_price", "null") \
+            .in_("product_name", [
+                "Hobby Box", "Blaster Box", "Mega Box", "Retail Box", "Value Box",
+                "Blaster Value Box", "Fat Pack", "Cello Pack", "Jumbo Pack",
+                "Hobby Pack", "Retail Pack", "Hanger Box", "Hanger Pack",
+                "Gravity Pack", "Gravity Feed", "Tin", "Collector Tin",
+                "Booster Box", "Booster Pack", "Bundle", "Case",
+            ]) \
+            .execute()
+        _sealed_scp_cache = result.data or []
+        log.info(f"Sealed cache: loaded {len(_sealed_scp_cache)} SCP sports products")
+    except Exception as e:
+        log.error(f"Failed to load SCP sealed cache: {e}")
+
+    _sealed_cache_loaded_at = now
+
+def lookup_sealed_price(product: str, category: str = "trading cards") -> dict | None:
+    if not product:
+        return None
+
+    load_sealed_cache()
+
+    query_tokens = tokenize_sealed(product)
+    query_year   = extract_year(product)
+
+    if len(query_tokens) < 2:
+        return None
+
+    # ===========================================================
+    # TCGCSV — Pokemon
+    # ===========================================================
+    if category == "pokemon" and _sealed_tcg_cache:
+        best_score = 0.0
+        best_match = None
+
+        for row in _sealed_tcg_cache:
+            name      = row.get("clean_name") or ""
+            name_year = extract_year(name)
+
+            if query_year and name_year and query_year != name_year:
+                continue
+
+            name_tokens = tokenize_sealed(name)
+            if not name_tokens:
+                continue
+
+            overlap = query_tokens & name_tokens
+
+            # Hard filter — product type tokens must match exactly
+            query_type_tokens = PRODUCT_TYPE_TOKENS & query_tokens
+            name_type_tokens  = PRODUCT_TYPE_TOKENS & name_tokens
+            if query_type_tokens and name_type_tokens and query_type_tokens != name_type_tokens:
+                continue
+
+            if len(overlap) < 3:
+                continue
+
+            score = len(overlap) / max(len(query_tokens), len(name_tokens))
+            if score > best_score and score >= 0.70:
+                best_score = score
+                best_match = row
+
+        if best_match:
+            try:
+                result = supabase_client.table("tcgcsv_prices_wide") \
+                    .select("market_price, low_price") \
+                    .eq("product_id", best_match["product_id"]) \
+                    .not_.is_("market_price", "null") \
+                    .limit(1) \
+                    .execute()
+                if result.data:
+                    return {
+                        "matched_name": best_match["clean_name"],
+                        "market_price": float(result.data[0]["market_price"]),
+                        "low_price":    float(result.data[0]["low_price"]) if result.data[0]["low_price"] else None,
+                        "source":       "TCGPlayer",
+                        "score":        round(best_score, 2),
+                    }
+            except Exception as e:
+                log.error(f"TCGCSV price fetch error: {e}")
+
+    # ===========================================================
+    # SCP — Sports
+    # ===========================================================
+    sport_map = {
+        "football": "football", "basketball": "basketball",
+        "baseball": "baseball", "hockey": "hockey",
+    }
+    scp_sport = sport_map.get(category)
+
+    if scp_sport and _sealed_scp_cache:
+        best_score = 0.0
+        best_match = None
+
+        for row in _sealed_scp_cache:
+            if (row.get("sport") or "").lower() != scp_sport:
+                continue
+
+            row_year = row.get("year")
+            if query_year and row_year and int(row_year) != query_year:
+                continue
+
+            combined   = f"{row.get('year') or ''} {row.get('brand') or ''} {row.get('product') or ''} {row.get('product_name') or ''}"
+            row_tokens = tokenize_sealed(combined)
+            if not row_tokens:
+                continue
+
+            # BUG FIX 2: use row_tokens, not name_tokens
+            overlap = query_tokens & row_tokens
+
+            # Hard filter — product type tokens must match exactly
+            query_type_tokens = PRODUCT_TYPE_TOKENS & query_tokens
+            row_type_tokens   = PRODUCT_TYPE_TOKENS & row_tokens
+            if query_type_tokens and row_type_tokens and query_type_tokens != row_type_tokens:
+                continue
+
+            if len(overlap) < 3:
+                continue
+
+            score = len(overlap) / max(len(query_tokens), len(row_tokens))
+            if score > best_score and score >= 0.70:
+                best_score = score
+                best_match = row
+
+        if best_match:
+            loose = best_match.get("loose_price")
+            if loose:
+                return {
+                    "matched_name": f"{best_match.get('year') or ''} {best_match.get('brand') or ''} {best_match.get('product') or ''} {best_match.get('product_name') or ''}".strip(),
+                    "market_price": float(loose),
+                    "low_price":    None,
+                    "source":       "SportsCardPro",
+                    "score":        round(best_score, 2),
+                }
+
+    return None
+
+
+def format_price_line(tweet_price: str, sealed_match: dict) -> str:
+    market = sealed_match["market_price"]
+    low    = sealed_match["low_price"]
+    source = sealed_match["source"]
+    name   = sealed_match["matched_name"]
+
+    tweet_val = None
+    if tweet_price:
+        m = re.search(r'[\d,.]+', tweet_price.replace(',', ''))
+        if m:
+            try:
+                tweet_val = float(m.group())
+            except ValueError:
+                pass
+
+    if tweet_val and market:
+        pct_diff  = ((tweet_val - market) / market) * 100
+        direction = f"{abs(pct_diff):.0f}% below market ✅" if pct_diff < -2 else \
+                    f"{abs(pct_diff):.0f}% above market ⚠️" if pct_diff > 2 else \
+                    "at market 〰️"
+        low_str = f" | Low: ${low:.2f}" if low else ""
+        return f"📈 {source}: ${market:.2f}{low_str} — {direction}\n🔍 Matched: {name}"
+    elif market:
+        low_str = f" | Low: ${low:.2f}" if low else ""
+        return f"📈 {source} Market: ${market:.2f}{low_str}\n🔍 Matched: {name}"
+
+    return None
+
+# ===========================================================================
 # Discord posting
 # ===========================================================================
 
@@ -450,9 +660,8 @@ def post_discord(tweet_data: dict, author_username: str):
     labeled_links = extract_links_with_labels(text, entities)
 
     if labeled_links:
-        # Parse tweet lines to associate product descriptions with links
         product_lines = parse_product_lines(text)
-        alerts_sent = 0
+        alerts_sent   = 0
 
         for i, (label, url) in enumerate(labeled_links[:6]):
             product = clean_link_title(label)
@@ -461,14 +670,12 @@ def post_discord(tweet_data: dict, author_username: str):
             if not product:
                 product = extract_product(text)
 
-            # Detect category from label too, since link titles often have product names
-            link_category = detect_category(label or "") if label else category
+            link_category      = detect_category(label or "") if label else category
             effective_category = link_category if link_category != "trading cards" else category
-            category_label = CATEGORY_EMOJIS.get(effective_category, "🃏 Trading Cards")
+            category_label     = CATEGORY_EMOJIS.get(effective_category, "🃏 Trading Cards")
 
             price = detect_price(text, context=product)
 
-            # Dedup per individual product
             fingerprint = make_fingerprint(alert_type, store, product)
             if is_duplicate(fingerprint):
                 log.info(f"Duplicate suppressed: @{author_username} — {product[:40]}")
@@ -479,9 +686,13 @@ def post_discord(tweet_data: dict, author_username: str):
             if price: meta_parts.append(f"💰 {price}")
             meta_line = "  ·  ".join(meta_parts)
 
+            sealed_match = lookup_sealed_price(product, effective_category)
+            price_line   = format_price_line(price, sealed_match) if sealed_match else None
+
             lines = []
-            if product:   lines.append(f"📦 {product}")
-            if meta_line: lines.append(meta_line)
+            if product:    lines.append(f"📦 {product}")
+            if meta_line:  lines.append(meta_line)
+            if price_line: lines.append(price_line)
 
             embed = {
                 "title":       f"{alert_emoji} {category_label} — {alert_type.upper()}",
@@ -500,10 +711,9 @@ def post_discord(tweet_data: dict, author_username: str):
             else:
                 alerts_sent += 1
                 log.info(f"Posted embed {alerts_sent}: {alert_type.upper()} — {product[:40]}")
-            time.sleep(0.3)  # avoid Discord rate limit
+            time.sleep(0.3)
 
     else:
-        # No links — single embed pointing to tweet
         product = extract_product(text)
         price   = detect_price(text)
 
@@ -517,9 +727,13 @@ def post_discord(tweet_data: dict, author_username: str):
         if price: meta_parts.append(f"💰 {price}")
         meta_line = "  ·  ".join(meta_parts)
 
+        sealed_match = lookup_sealed_price(product, category)
+        price_line   = format_price_line(price, sealed_match) if sealed_match else None
+
         lines = []
-        if product:   lines.append(f"📦 {product}")
-        if meta_line: lines.append(meta_line)
+        if product:    lines.append(f"📦 {product}")
+        if meta_line:  lines.append(meta_line)
+        if price_line: lines.append(price_line)  # BUG FIX 3: was missing in no-links fallback
         lines.append(f"🔗 [View Tweet]({tweet_url})")
 
         embed = {
@@ -569,14 +783,13 @@ def stream():
         if resp.status_code == 429:
             log.warning(f"Rate limited (429) — backing off {retry_delay}s before retry...")
             time.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, 900)  # cap at 15 minutes
+            retry_delay = min(retry_delay * 2, 900)
             return
 
         if not resp.ok:
             log.error(f"Stream error {resp.status_code}: {resp.text}")
             return
 
-        # Successful connection — reset backoff
         retry_delay = 30
         log.info("Stream connected — listening for tweets...")
 
