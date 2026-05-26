@@ -60,6 +60,8 @@ STORE_MAP = {
     "dicks":      "Dick's Sporting Goods",
     "scheels":    "Scheels",
     "best buy":   "Best Buy",
+    "barnes & noble": "Barnes & Noble",
+    "barnes and noble": "Barnes & Noble",
 }
 
 ALERT_COLORS = {
@@ -729,7 +731,8 @@ def post_discord(tweet_data: dict, author_username: str):
             # FIX 2: Skip embed if product resolved to a URL fragment
             if is_url_like(product):
                 log.info(f"Skipped URL-shaped product name: {product!r} from @{author_username}")
-                product = None
+                # Try remaining product_lines before giving up
+                product = next((p for p in product_lines[i:] if not is_url_like(p)), None)
 
             link_category      = detect_category(label or "") if label else category
             effective_category = link_category if link_category != "trading cards" else category
