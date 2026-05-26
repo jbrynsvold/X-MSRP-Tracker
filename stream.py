@@ -33,41 +33,45 @@ ACCOUNTS = [
 ]
 
 ALERT_EMOJIS = {
-    "restock": "🚨",
+    "restock":  "🚨",
     "in stock": "✅",
-    "deal": "💰",
-    "alert": "📣",
+    "deal":     "💰",
+    "alert":    "📣",
+    "preorder": "🗓️",  # FIX 3: new preorder type
 }
 
 CATEGORY_EMOJIS = {
-    "pokemon": "⚡ Pokémon TCG",
-    "football": "🏈 Football",
-    "baseball": "⚾ Baseball",
+    "pokemon":    "⚡ Pokémon TCG",
+    "football":   "🏈 Football",
+    "baseball":   "⚾ Baseball",
     "basketball": "🏀 Basketball",
-    "hockey": "🏒 Hockey",
+    "hockey":     "🏒 Hockey",
 }
 
 STORE_MAP = {
-    "target": "Target",
-    "walmart": "Walmart",
-    "amazon": "Amazon",
-    "costco": "Costco",
-    "gamestop": "GameStop",
-    "bestbuy": "Best Buy",
-    "toysrus": "Toys R Us",
-    "dick's": "Dick's Sporting Goods",
-    "dicks": "Dick's Sporting Goods",
-    "scheels": "Scheels",
-    "best buy": "Best Buy",
+    "target":     "Target",
+    "walmart":    "Walmart",
+    "amazon":     "Amazon",
+    "costco":     "Costco",
+    "gamestop":   "GameStop",
+    "bestbuy":    "Best Buy",
+    "toysrus":    "Toys R Us",
+    "dick's":     "Dick's Sporting Goods",
+    "dicks":      "Dick's Sporting Goods",
+    "scheels":    "Scheels",
+    "best buy":   "Best Buy",
 }
 
 ALERT_COLORS = {
-    "restock": 0xFF4500,
+    "restock":  0xFF4500,
     "in stock": 0x2ECC71,
-    "deal": 0xF1C40F,
-    "alert": 0x3498DB,
+    "deal":     0xF1C40F,
+    "alert":    0x3498DB,
+    "preorder": 0x9B59B6,  # FIX 3: purple for preorders
 }
 
+# FIX 1: Expanded signal list to catch restock-account phrasing like
+# "is up at Target", "checking out", "back at", "still up", etc.
 REQUIRED_SIGNALS = [
     r'\$[\d,]+\.?\d*',
     r'\bin stock\b',
@@ -81,6 +85,17 @@ REQUIRED_SIGNALS = [
     r'\bjust\s+dropped\b',
     r'\bback\s+in\s+stock\b',
     r'\blive\s+now\b',
+    # --- NEW signals below ---
+    r'\bis\s+up\s+(at|on)\b',          # "is up at Target", "is up on Amazon"
+    r'\bup\s+(at|on)\b',               # "up at Target", "up on Walmart"
+    r'\bback\s+(at|on|up)\b',          # "back at Target", "back on Amazon", "back up"
+    r'\bchecking\s+out\b',             # "checking out on Target"
+    r'\bstill\s+(up|checking\s+out)\b',# "still up", "still checking out"
+    r'\bgoing\s+live\b',               # "going live"
+    r'\bnow\s+(available|live)\b',     # "now available", "now live"
+    r'\bstock\s+alert\b',              # "stock alert"
+    r'\bjust\s+(went|gone)\s+live\b',  # "just went live"
+    r'\bspam\s+place\s+order\b',       # "spam place order" (restock-account specific)
 ]
 
 HARD_BLOCKLIST = [
@@ -119,12 +134,6 @@ HARD_BLOCKLIST = [
     "fake news",
     "posting fake news",
     "reputable accounts",
-    "sam's club membership",
-    "sams club membership",
-    "membership deal",
-    "1-year membership",
-    "plus membership",
-    "basic membership",
     "next week is going to be huge",
     "good luck if you're opening",
     "have a great weekend",
@@ -136,6 +145,24 @@ HARD_BLOCKLIST = [
     " draw ",
     "raffle",
     "enter now for",
+]
+
+# Per-link blocklist — skips individual links rather than dropping the whole tweet.
+# Membership upsells, affiliate signups, etc. often appear alongside real deal links.
+LINK_BLOCKLIST = [
+    "membership",
+    "sam's club",
+    "sams club",
+    "walmart+",
+    "walmart plus",
+    "costco membership",
+    "subscribe",
+    "referral",
+    "sign up",
+    "affiliate",
+    "/join",
+    "/signup",
+    "/subscribe",
 ]
 
 DEDUP_WINDOW_HOURS = 2
@@ -201,6 +228,11 @@ def is_blocked(text: str) -> bool:
     text_lower = text.lower()
     return any(re.search(phrase, text_lower) for phrase in HARD_BLOCKLIST)
 
+def is_blocked_link(label: str, url: str) -> bool:
+    """Per-link filter — returns True if this specific link should be skipped."""
+    combined = f"{label or ''} {url or ''}".lower()
+    return any(term in combined for term in LINK_BLOCKLIST)
+
 def should_post(text: str, author_username: str) -> bool:
     if not has_deal_signal(text):
         log.info(f"Dropped (no deal signal): @{author_username} — {text[:80]}")
@@ -234,12 +266,19 @@ def is_duplicate(fingerprint: str) -> bool:
 
 def detect_alert_type(text: str) -> str:
     text_lower = text.lower()
+    # FIX 3: Check for preorder before other types
+    if any(t in text_lower for t in ["preorder", "pre-order", "pre order"]):
+        return "preorder"
     if "in stock" in text_lower:
         return "in stock"
-    if "restock" in text_lower:
+    if "restock" in text_lower or re.search(r'\bback\s+(at|on|up)\b', text_lower):
         return "restock"
     if "deal" in text_lower:
         return "deal"
+    # FIX 1: tweets that passed via "is up at" / "up on" / "checking out"
+    # should be classified as "in stock" not generic "alert"
+    if re.search(r'\b(is\s+up|up\s+(at|on)|checking\s+out|now\s+available|going\s+live)\b', text_lower):
+        return "in stock"
     return "alert"
 
 def detect_category(text: str) -> str:
@@ -453,7 +492,6 @@ def load_sealed_cache():
     if now - _sealed_cache_loaded_at < SEALED_CACHE_TTL:
         return
 
-    # BUG FIX 1: TCGCSV cache queries tcgcsv_products, not scp_prices
     try:
         result = supabase_client.table("tcgcsv_products") \
             .select("product_id, clean_name") \
@@ -465,7 +503,6 @@ def load_sealed_cache():
     except Exception as e:
         log.error(f"Failed to load TCGCSV sealed cache: {e}")
 
-    # SCP — sports sealed with prices, filtered to real sealed product types only
     try:
         result = supabase_client.table("scp_prices") \
             .select("product_name, product, brand, year, sport, loose_price") \
@@ -518,7 +555,6 @@ def lookup_sealed_price(product: str, category: str = "trading cards") -> dict |
 
             overlap = query_tokens & name_tokens
 
-            # Hard filter — product type tokens must match exactly
             query_type_tokens = PRODUCT_TYPE_TOKENS & query_tokens
             name_type_tokens  = PRODUCT_TYPE_TOKENS & name_tokens
             if query_type_tokens and name_type_tokens and query_type_tokens != name_type_tokens:
@@ -555,8 +591,10 @@ def lookup_sealed_price(product: str, category: str = "trading cards") -> dict |
     # SCP — Sports
     # ===========================================================
     sport_map = {
-        "football": "football", "basketball": "basketball",
-        "baseball": "baseball", "hockey": "hockey",
+        "football":   "football",
+        "basketball": "basketball",
+        "baseball":   "baseball",
+        "hockey":     "hockey",
     }
     scp_sport = sport_map.get(category)
 
@@ -577,10 +615,8 @@ def lookup_sealed_price(product: str, category: str = "trading cards") -> dict |
             if not row_tokens:
                 continue
 
-            # BUG FIX 2: use row_tokens, not name_tokens
             overlap = query_tokens & row_tokens
 
-            # Hard filter — product type tokens must match exactly
             query_type_tokens = PRODUCT_TYPE_TOKENS & query_tokens
             row_type_tokens   = PRODUCT_TYPE_TOKENS & row_tokens
             if query_type_tokens and row_type_tokens and query_type_tokens != row_type_tokens:
@@ -637,6 +673,22 @@ def format_price_line(tweet_price: str, sealed_match: dict) -> str:
     return None
 
 # ===========================================================================
+# Helpers
+# ===========================================================================
+
+def is_url_like(text: str) -> bool:
+    """FIX 2: Guard against URL fragments being used as product names."""
+    if not text:
+        return True
+    stripped = text.strip()
+    # Looks like a bare domain/path (e.g. "thetoppscompany.sjv.io/QYngVx")
+    if re.match(r'^https?://', stripped):
+        return True
+    if re.match(r'^[\w.-]+\.[a-z]{2,}/\S+$', stripped, re.IGNORECASE):
+        return True
+    return False
+
+# ===========================================================================
 # Discord posting
 # ===========================================================================
 
@@ -663,11 +715,21 @@ def post_discord(tweet_data: dict, author_username: str):
         alerts_sent   = 0
 
         for i, (label, url) in enumerate(labeled_links[:6]):
+            # Skip membership upsells / affiliate links at the per-link level
+            if is_blocked_link(label, url):
+                log.info(f"Skipped blocked link: {label!r} => {url[:60]}")
+                continue
+
             product = clean_link_title(label)
             if not product and i < len(product_lines):
                 product = product_lines[i]
             if not product:
                 product = extract_product(text)
+
+            # FIX 2: Skip embed if product resolved to a URL fragment
+            if is_url_like(product):
+                log.info(f"Skipped URL-shaped product name: {product!r} from @{author_username}")
+                product = None
 
             link_category      = detect_category(label or "") if label else category
             effective_category = link_category if link_category != "trading cards" else category
@@ -675,9 +737,9 @@ def post_discord(tweet_data: dict, author_username: str):
 
             price = detect_price(text, context=product)
 
-            fingerprint = make_fingerprint(alert_type, store, product)
+            fingerprint = make_fingerprint(alert_type, store, product or url)
             if is_duplicate(fingerprint):
-                log.info(f"Duplicate suppressed: @{author_username} — {product[:40]}")
+                log.info(f"Duplicate suppressed: @{author_username} — {(product or url)[:40]}")
                 continue
 
             meta_parts = []
@@ -685,7 +747,7 @@ def post_discord(tweet_data: dict, author_username: str):
             if price: meta_parts.append(f"💰 {price}")
             meta_line = "  ·  ".join(meta_parts)
 
-            sealed_match = lookup_sealed_price(product, effective_category)
+            sealed_match = lookup_sealed_price(product, effective_category) if product else None
             price_line   = format_price_line(price, sealed_match) if sealed_match else None
 
             lines = []
@@ -696,7 +758,7 @@ def post_discord(tweet_data: dict, author_username: str):
             embed = {
                 "title":       f"{alert_emoji} {category_label} — {alert_type.upper()}",
                 "url":         url,
-                "description": '\n'.join(lines),
+                "description": '\n'.join(lines) if lines else "*(tap to view)*",
                 "color":       color,
             }
 
@@ -709,14 +771,19 @@ def post_discord(tweet_data: dict, author_username: str):
                 log.error(f"Discord error {resp.status_code}: {resp.text}")
             else:
                 alerts_sent += 1
-                log.info(f"Posted embed {alerts_sent}: {alert_type.upper()} — {product[:40]}")
+                log.info(f"Posted embed {alerts_sent}: {alert_type.upper()} — {(product or url)[:40]}")
             time.sleep(0.3)
 
     else:
         product = extract_product(text)
-        price   = detect_price(text)
 
-        fingerprint = make_fingerprint(alert_type, store, product)
+        # FIX 2: Don't use a URL fragment as a product name in fallback path either
+        if is_url_like(product):
+            product = None
+
+        price = detect_price(text)
+
+        fingerprint = make_fingerprint(alert_type, store, product or tweet_url)
         if is_duplicate(fingerprint):
             log.info(f"Duplicate suppressed: @{author_username}")
             return
@@ -726,13 +793,13 @@ def post_discord(tweet_data: dict, author_username: str):
         if price: meta_parts.append(f"💰 {price}")
         meta_line = "  ·  ".join(meta_parts)
 
-        sealed_match = lookup_sealed_price(product, category)
+        sealed_match = lookup_sealed_price(product, category) if product else None
         price_line   = format_price_line(price, sealed_match) if sealed_match else None
 
         lines = []
         if product:    lines.append(f"📦 {product}")
         if meta_line:  lines.append(meta_line)
-        if price_line: lines.append(price_line)  # BUG FIX 3: was missing in no-links fallback
+        if price_line: lines.append(price_line)
         lines.append(f"🔗 [View Tweet]({tweet_url})")
 
         embed = {
