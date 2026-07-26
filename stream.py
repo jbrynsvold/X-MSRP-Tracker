@@ -29,7 +29,10 @@ ACCOUNTS = [
     "DropDexHQ",
     "VIVID_RESTOCK",
     "pokepullzhq",
-    "Detailed91"
+    "Detailed91",
+    "PokeRestockHQ",   # Pokemon Center / Walmart / Target focused, no giveaway noise seen
+    "DropsMonitor",    # ricanking6's dedicated alert account (separate from his personal one)
+    "HobbyRecap",      # daily sports card restocks — has run giveaways before, HARD_BLOCKLIST should catch those
 ]
 
 ALERT_EMOJIS = {
@@ -166,6 +169,78 @@ LINK_BLOCKLIST = [
     "/signup",
     "/subscribe",
 ]
+
+# FIX 4: Generic app-promo/self-referral title patterns (e.g. "Download The Free
+# TrackaLacker Restock Alerts App - TrackaLacker"). These come from the og:title
+# metadata Twitter attaches to a link (entities.urls[].title), NOT from the tweet
+# text itself, and get used as a "product name" if not caught.
+#
+# IMPORTANT: this is pattern-based on purpose, not a hardcoded "trackalacker" string
+# in LINK_BLOCKLIST — several tracked accounts (e.g. TCGTouchdown) legitimately post
+# real deal links through trackalacker.com (e.g. trackalacker.com/products/showcase/...),
+# so blocking the domain/brand name outright would also kill real alerts. Only the
+# promotional title text gets filtered.
+PROMO_TITLE_PATTERNS = [
+    r'\bdownload\b.{0,25}\bapp\b',
+    r'\brestock alerts?\s+app\b',
+    r'\bget (the |our )?app\b',
+    r'\bnotifications?\b.{0,20}\bapp\b',
+    r'\bturn on notifications\b',
+]
+
+def is_promo_title(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(re.search(p, t) for p in PROMO_TITLE_PATTERNS)
+
+# ===========================================================================
+# FIX 5: Shared noise stripping for product-name extraction.
+#
+# Previously `extract_product()` and `parse_product_lines()` each carried their
+# own separate noise-word list and line filters, and the two lists had already
+# drifted apart (e.g. "Stock:"/"Limit:" handling and the "Good luck"/"Walmart +
+# not needed" entries only existed in one of the two functions). That drift is
+# itself a source of inconsistent parsing — a fix added to one path silently
+# doesn't apply to the other. Consolidating into one shared list + one shared
+# line-noise check means every future noise pattern gets added once and applies
+# everywhere product text gets built.
+# ===========================================================================
+
+NOISE_PHRASES = [
+    "IN STOCK ALERT", "RESTOCK", "IN STOCK", "Sold by", "As of",
+    "Follow", "Bookmark", "Save this", "We'll tweet", "We'll post",
+    "follow with notifications", "alert if they drop",
+    "historically restocks", "MSRP",
+    "Walmart + not needed", "Walmart+ not needed",
+    "Good luck", "Limit should be",
+    "Turn on notifications",
+    "🛎️", "🚨", "📣", "✅", "💰", "🏪", "📦", "🔗", "📡", "☑️",
+    "🛒", "🎯", "⏰", "🔔", "🛍️", "🏷️",
+]
+
+# Line-level patterns: a line matching any of these is noise, not a product name.
+NOISE_LINE_PATTERNS = [
+    r'^[\$\d\s\.,()+%-]+$',           # pure price/number punctuation
+    r'^(stock|limit)\s*:',            # "Stock: 511", "Limit: 2 Per Order"
+    r'^\d+\s*(left|remaining|in stock)\b',
+    r'^(sold by|as of)\b',
+]
+
+def _strip_noise_phrases(text: str) -> str:
+    for n in NOISE_PHRASES:
+        text = re.sub(re.escape(n), '', text, flags=re.IGNORECASE)
+    return text
+
+def _is_noise_line(line: str, min_len: int = 8) -> bool:
+    if len(line) < min_len:
+        return True
+    for pat in NOISE_LINE_PATTERNS:
+        if re.match(pat, line, flags=re.IGNORECASE):
+            return True
+    if is_promo_title(line):
+        return True
+    return False
 
 DEDUP_WINDOW_HOURS = 2
 seen_fingerprints: dict = {}
@@ -340,6 +415,15 @@ def extract_links_with_labels(text: str, entities: dict = None) -> list:
             if not final_url or should_skip(final_url) or should_skip(expanded):
                 continue
             raw = url_obj.get("title") or url_obj.get("display_url") or None
+
+            # FIX 4: drop app-download / self-promo links outright — they aren't
+            # deal links and shouldn't spawn their own embed. Checked on the raw
+            # title before any cleanup, since clean_link_title() only strips known
+            # store-name suffixes, not promotional phrasing.
+            if is_promo_title(raw):
+                log.info(f"Skipped promo link: {raw!r} => {final_url[:60]}")
+                continue
+
             label = clean_link_title(raw) or raw
             results.append((label, final_url))
             log.debug(f"Entity link: {label!r} => {final_url}")
@@ -354,6 +438,11 @@ def extract_links_with_labels(text: str, entities: dict = None) -> list:
             label = m.group(1).strip().title()
             url   = m.group(2).rstrip('.,)')
             if should_skip(url):
+                continue
+            # FIX 4: same promo-title guard on the text-fallback path
+            if is_promo_title(label):
+                log.info(f"Skipped promo link (fallback parse): {label!r} => {url[:60]}")
+                matched_urls.add(url)
                 continue
             results.append((label, url))
             matched_urls.add(url)
@@ -375,27 +464,23 @@ def extract_product(text: str) -> str:
     text = re.sub(r'\d{1,2}:\d{2}\s*[APap][Mm]\s*[A-Z]{2,4}', '', text)
     text = re.sub(r'\(Less than[^)]*\)', '', text, flags=re.IGNORECASE)
     text = re.sub(r'Less than MSRP', '', text, flags=re.IGNORECASE)
+    # FIX 5: "Stock: 511", "Limit: 2 Per Order" style badges, wherever they land in the text
+    text = re.sub(r'\bStock:\s*[\d,]+\b', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bLimit:?\s*\d+\s*(Per Order)?\b', '', text, flags=re.IGNORECASE)
 
-    noise = [
-        "IN STOCK ALERT", "RESTOCK", "IN STOCK", "Sold by", "As of",
-        "Follow", "Bookmark", "Save this", "We'll tweet", "We'll post",
-        "follow with notifications", "alert if they drop",
-        "historically restocks", "MSRP",
-        "🛎️", "🚨", "📣", "✅", "💰", "🏪", "📦", "🔗", "📡",
-    ]
-    for n in noise:
-        text = re.sub(re.escape(n), '', text, flags=re.IGNORECASE)
+    text = _strip_noise_phrases(text)
 
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    lines = [l.strip(' -•·') for l in text.split('\n') if l.strip()]
     product_lines = []
     for line in lines:
-        if len(line) < 10:
-            continue
-        if re.match(r'^[\$\d\s\.,()+%-]+$', line):
+        if _is_noise_line(line):
             continue
         if any(line.strip().lower() == s.lower() for s in list(STORE_MAP.values())):
             continue
         if re.match(r'^[A-Z][A-Za-z0-9]+$', line) and len(line) < 20:
+            continue
+        # FIX 5: skip exact repeats (some tweets restate the same product line twice)
+        if product_lines and product_lines[-1].lower() == line.lower():
             continue
         product_lines.append(line)
 
@@ -430,23 +515,18 @@ def parse_product_lines(text: str) -> list:
     cleaned = re.sub(r'Stock:\s*[\d\.]+[kKmM]?', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'#AD|#ad|\bAD\b', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'\$[\d,]+\.?\d*', '', cleaned)
+    # FIX 5: same badge-style noise extract_product() now strips, kept in sync here too
+    cleaned = re.sub(r'\bLimit:?\s*\d+\s*(Per Order)?\b', '', cleaned, flags=re.IGNORECASE)
 
-    noise = [
-        "IN STOCK ALERT", "RESTOCK", "IN STOCK", "Sold by", "As of",
-        "Follow", "Bookmark", "Save this", "We'll tweet", "We'll post",
-        "Walmart + not needed", "Walmart+ not needed",
-        "Good luck", "Limit should be",
-        "🛎️", "🚨", "📣", "✅", "💰", "🏪", "📦", "🔗", "📡", "☑️",
-    ]
-    for n in noise:
-        cleaned = re.sub(re.escape(n), '', cleaned, flags=re.IGNORECASE)
+    cleaned = _strip_noise_phrases(cleaned)
 
     lines = []
-    for line in cleaned.split('\n'):
-        line = line.strip(' -•·')
-        if len(line) < 8:
+    for raw_line in cleaned.split('\n'):
+        line = raw_line.strip(' -•·')
+        if _is_noise_line(line):
             continue
-        if re.match(r'^[\$\d\s\.,()+%-]+$', line):
+        # FIX 5: skip exact repeats
+        if lines and lines[-1].lower() == line.lower():
             continue
         lines.append(line)
 
