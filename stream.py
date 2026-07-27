@@ -30,6 +30,7 @@ ACCOUNTS = [
     "VIVID_RESTOCK",
     "pokepullzhq",
     "Detailed91",
+    # --- NEW candidates (verify handles/still-active before relying on these) ---
     "PokeRestockHQ",   # Pokemon Center / Walmart / Target focused, no giveaway noise seen
     "DropsMonitor",    # ricanking6's dedicated alert account (separate from his personal one)
     "HobbyRecap",      # daily sports card restocks — has run giveaways before, HARD_BLOCKLIST should catch those
@@ -242,6 +243,11 @@ def _is_noise_line(line: str, min_len: int = 8) -> bool:
         return True
     return False
 
+# FIX 7: temporarily disabled per request — flip back to True once parsing
+# accuracy (product/store/link correctness) is confirmed. Left the rest of
+# the dedup machinery in place so re-enabling is a one-line change.
+DEDUP_ENABLED = False
+
 DEDUP_WINDOW_HOURS = 2
 seen_fingerprints: dict = {}
 
@@ -306,8 +312,19 @@ def is_blocked(text: str) -> bool:
     return any(re.search(phrase, text_lower) for phrase in HARD_BLOCKLIST)
 
 def is_blocked_link(label: str, url: str) -> bool:
-    """Per-link filter — returns True if this specific link should be skipped."""
-    combined = f"{label or ''} {url or ''}".lower()
+    """Per-link filter — returns True if this specific link should be skipped.
+
+    FIX 8: strips the URL's query string before checking. Terms like
+    "referral" and "affiliate" are common substrings in completely ordinary
+    tracking parameters (?utm_medium=referral, &ref=affiliate123, etc.) that
+    show up on legitimate product links from major retailers — checking the
+    full URL including query string meant real deal links could get
+    silently dropped here just for carrying normal tracking params, with no
+    visible sign why. Only the path is checked against terms like
+    "/signup"/"/subscribe"; label/title text is unaffected by this change.
+    """
+    url_path = (url or '').split('?', 1)[0]
+    combined = f"{label or ''} {url_path}".lower()
     return any(term in combined for term in LINK_BLOCKLIST)
 
 def should_post(text: str, author_username: str) -> bool:
@@ -328,6 +345,8 @@ def make_fingerprint(alert_type: str, store: str, product: str) -> str:
     return hashlib.md5(key.encode()).hexdigest()
 
 def is_duplicate(fingerprint: str) -> bool:
+    if not DEDUP_ENABLED:
+        return False
     now = datetime.utcnow()
     if fingerprint in seen_fingerprints:
         if now - seen_fingerprints[fingerprint] < timedelta(hours=DEDUP_WINDOW_HOURS):
@@ -373,10 +392,19 @@ def detect_category(text: str) -> str:
     return "trading cards"
 
 def detect_store(text: str) -> str:
+    """FIX 7: only return a store when the tweet unambiguously mentions
+    exactly one. Previously this returned the FIRST STORE_MAP match found
+    anywhere in the whole tweet — for a multi-store tweet (Amazon, Best Buy,
+    AND Target all mentioned) that meant every embed generated from it got
+    stamped with whichever store happened to appear first, regardless of
+    which link it was actually for. Better to show no store at all than a
+    wrong one; per-link store attribution (which IS reliable, since it
+    reads the store name directly off that link's own line) is handled
+    separately via _walk_line_context()."""
     text_lower = text.lower()
-    for key, name in STORE_MAP.items():
-        if key in text_lower:
-            return name
+    matches = {name for key, name in STORE_MAP.items() if key in text_lower}
+    if len(matches) == 1:
+        return next(iter(matches))
     return None
 
 def detect_price(text: str, context: str = None) -> str:
@@ -393,12 +421,16 @@ def detect_price(text: str, context: str = None) -> str:
 def extract_links_with_labels(text: str, entities: dict = None) -> list:
     SKIP_PATTERNS = [
         "twitter.com/intent",
-        "t.co/",
         "x.com/i/",
         "/photo/",
         "pic.x.com",
         "pic.twitter.com",
     ]
+    # FIX 7: "t.co/" used to be in this list, which meant the new raw-url
+    # fallback above (used only when unwound/expanded are both missing)
+    # would immediately get skipped again right after being added — the
+    # exact case it exists to handle. The real targets of this list are
+    # intent/photo endpoints, which the remaining patterns still catch.
     results = []
 
     def should_skip(url):
@@ -406,9 +438,14 @@ def extract_links_with_labels(text: str, entities: dict = None) -> list:
 
     if entities and "urls" in entities:
         for url_obj in entities["urls"]:
+            # FIX 7: fall back to the raw t.co url when unwound/expanded are
+            # both missing (can happen when X hasn't unfurled a link yet) —
+            # previously this link was silently dropped entirely rather than
+            # posted with a less-pretty-but-still-working url.
             final_url = (
                 url_obj.get("unwound_url")
                 or url_obj.get("expanded_url")
+                or url_obj.get("url")
                 or ""
             )
             expanded = url_obj.get("expanded_url", "")
@@ -452,7 +489,11 @@ def extract_links_with_labels(text: str, entities: dict = None) -> list:
                 continue
             results.append((None, url))
 
-    return results[:6]
+    # FIX 6: raised from 6 — "roundup" tweets (multiple products, each with
+    # 2-3 store links) blow past 6 links easily, and the old cap silently
+    # dropped trailing links (the PokemonDealsTCG example had 7). 20 is a
+    # generous ceiling against runaway/spam tweets rather than a real limit.
+    return results[:20]
 
 def extract_product(text: str) -> str:
     text = re.sub(r'https?://\S+', '', text)
@@ -468,11 +509,23 @@ def extract_product(text: str) -> str:
     text = re.sub(r'\bStock:\s*[\d,]+\b', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\bLimit:?\s*\d+\s*(Per Order)?\b', '', text, flags=re.IGNORECASE)
 
+    # FIX 7: check promo-title against these RAW (pre-noise-strip) lines,
+    # not the noise-stripped ones below. NOISE_PHRASES strips the bare word
+    # "RESTOCK" (legitimate elsewhere), which would silently delete the
+    # "restock" in "Restock Alerts App" and defeat the promo-title match if
+    # checked after stripping. Line count is preserved by both splits (only
+    # in-line substitutions happen, no lines are merged/removed), so they
+    # stay aligned by index for zipping.
+    raw_lines = [l.strip(' -•·') for l in text.split('\n')]
     text = _strip_noise_phrases(text)
+    stripped_lines = [l.strip(' -•·') for l in text.split('\n')]
 
-    lines = [l.strip(' -•·') for l in text.split('\n') if l.strip()]
     product_lines = []
-    for line in lines:
+    for raw_line, line in zip(raw_lines, stripped_lines):
+        if is_promo_title(raw_line):
+            continue
+        if not line:
+            continue
         if _is_noise_line(line):
             continue
         if any(line.strip().lower() == s.lower() for s in list(STORE_MAP.values())):
@@ -518,11 +571,17 @@ def parse_product_lines(text: str) -> list:
     # FIX 5: same badge-style noise extract_product() now strips, kept in sync here too
     cleaned = re.sub(r'\bLimit:?\s*\d+\s*(Per Order)?\b', '', cleaned, flags=re.IGNORECASE)
 
+    # FIX 7: same raw-vs-stripped ordering fix as extract_product() — check
+    # promo-title before NOISE_PHRASES can strip "RESTOCK" out of a promo
+    # line's text and defeat the match.
+    raw_lines = [l.strip(' -•·') for l in cleaned.split('\n')]
     cleaned = _strip_noise_phrases(cleaned)
+    stripped_lines = [l.strip(' -•·') for l in cleaned.split('\n')]
 
     lines = []
-    for raw_line in cleaned.split('\n'):
-        line = raw_line.strip(' -•·')
+    for raw_line, line in zip(raw_lines, stripped_lines):
+        if is_promo_title(raw_line):
+            continue
         if _is_noise_line(line):
             continue
         # FIX 5: skip exact repeats
@@ -531,6 +590,167 @@ def parse_product_lines(text: str) -> list:
         lines.append(line)
 
     return lines
+
+# ===========================================================================
+# FIX 6: "Roundup" tweet grouping
+#
+# Some accounts (PokemonDealsTCG is the clearest example) post one tweet
+# listing several products, each followed by 1-3 "Store: link" lines, e.g.:
+#
+#   August 7th: First Partner Illustration Collection Series 3
+#   Amazon <link>
+#   Best Buy <link>
+#   Target <link>
+#
+#   August 28th: Ascended Heroes Tins
+#   Amazon <link>
+#   Best Buy <link>
+#
+# The old per-link loop treated every link as its own "deal" and guessed at
+# a product name for each one independently, which produced mislabeled
+# embeds (a store name like "Best Buy" ending up AS the product name) and
+# store misattribution (detect_store() reads the whole tweet, so every
+# embed from a multi-store tweet got stamped with whichever store name
+# appears first in STORE_MAP order, regardless of which link it actually
+# was). This groups by product instead, so each product gets exactly one
+# embed with its store links correctly attached.
+# ===========================================================================
+
+_STORE_LINE_RE = re.compile(
+    r'^(?P<store>' + '|'.join(re.escape(k) for k in sorted(STORE_MAP.keys(), key=len, reverse=True)) + r')\b\s*[:\-]?\s*',
+    re.IGNORECASE,
+)
+
+_ROUNDUP_BOILERPLATE_PATTERNS = [
+    r"\bwe'?ll?\s+(post|tweet|share)\b",
+    r"\bwe will\s+(post|tweet|share)\b",
+    r'\bnote:',
+    r'\bsave this (post|thread)\b',
+    r'\bmore (links|updates|alerts)\b',
+    r'\bwhen available\b',
+]
+
+def _is_roundup_boilerplate(line: str) -> bool:
+    t = line.lower()
+    return any(re.search(p, t) for p in _ROUNDUP_BOILERPLATE_PATTERNS) or is_promo_title(line)
+
+def _walk_line_context(text: str) -> list:
+    """
+    FIX 7: single shared line-walker, replacing two separate implementations
+    that used to exist (the old buggy `product_lines[i:]` index-guessing in
+    the legacy per-link path, and a near-duplicate walker that used to live
+    only inside parse_roundup_blocks()). One pass over the tweet's lines,
+    returning one context dict per line that contains a URL, IN ORDER:
+
+        {"store": str|None, "own_text": str, "header": str|None}
+
+    "store"    — set ONLY when that exact line starts with a recognized
+                 store name (e.g. "Amazon <link>"). This is the one case
+                 trusted with full confidence, since the text is explicitly
+                 telling us the store right next to that specific link.
+    "own_text" — whatever text sits on that same line besides the store
+                 prefix and the URL itself (covers single-line
+                 "Product Name — Store: link" formats).
+    "header"   — nearest preceding non-noise, non-link line. Used as the
+                 product name when the URL's own line has no text of its
+                 own (the common "Product Name\\nStore: link" shape).
+
+    Because both parse_roundup_blocks() and the legacy per-link fallback now
+    read from this single function, product/store context can't drift
+    between the two paths the way extract_product()/parse_product_lines()
+    drifted before FIX 5.
+    """
+    contexts = []
+    current_header = None
+
+    for raw_line in text.split('\n'):
+        line = raw_line.strip(' -•·\t')
+        if not line:
+            continue
+
+        has_url = bool(re.search(r'https?://\S+', line))
+
+        if has_url:
+            # FIX 7: check promo-title on the RAW line before any noise
+            # stripping touches it. NOISE_PHRASES includes the bare word
+            # "RESTOCK" (legitimate for real alert text), and stripping it
+            # first would silently delete the "restock" in "Restock Alerts
+            # App", breaking the promo-title match downstream. A promo
+            # link's line becomes NO context at all here — that's also what
+            # keeps the context count aligned with the links count in
+            # parse_roundup_blocks, since extract_links_with_labels() drops
+            # the same link at the entities level.
+            if is_promo_title(line):
+                continue
+            m = _STORE_LINE_RE.match(line)
+            store = STORE_MAP[m.group('store').lower()] if m else None
+            own_text = re.sub(r'https?://\S+', '', line)
+            if m:
+                own_text = own_text[m.end():]
+            # Apply the same cleanup parse_product_lines() used to do, so a
+            # single-line tweet with the url inline (e.g. "IN STOCK ALERT
+            # ... is in stock at Topps for $11.99 <url> #topps As of ...")
+            # doesn't regress to raw, unstripped text.
+            own_text = re.sub(r'#\w+', '', own_text)
+            own_text = re.sub(r'#AD|#ad|\bAD\b', '', own_text, flags=re.IGNORECASE)
+            own_text = re.sub(r'\$[\d,]+\.?\d*', '', own_text)
+            own_text = re.sub(r'\d{1,2}/\d{1,2}/\d{2,4}\s+\d{1,2}:\d{2}\s*[APap][Mm]\s*[A-Z]{2,4}', '', own_text)
+            own_text = re.sub(r'\d{1,2}:\d{2}\s*[APap][Mm]\s*[A-Z]{2,4}', '', own_text)
+            own_text = _strip_noise_phrases(own_text)
+            own_text = own_text.strip(' -:\t')
+            contexts.append({"store": store, "own_text": own_text, "header": current_header})
+            continue
+
+        # no URL on this line — either a new product header or boilerplate/noise
+        if _is_roundup_boilerplate(line) or _is_noise_line(line, min_len=4):
+            continue
+        if any(line.lower() == s.lower() for s in STORE_MAP.values()):
+            continue
+
+        current_header = line
+
+    return contexts
+
+def parse_roundup_blocks(text: str, entities: dict = None):
+    """
+    Try to parse a multi-product 'roundup' tweet into product blocks.
+    Returns a list of dicts: [{"product": str, "stores": [(store_name_or_None, url), ...]}, ...]
+    or None if the tweet doesn't look like this shape (caller should fall
+    back to the existing per-link logic).
+    """
+    links = extract_links_with_labels(text, entities)
+    if len(links) < 2:
+        return None  # not worth grouping — legacy single-link path handles this fine
+
+    contexts = _walk_line_context(text)
+
+    # Contexts must line up 1:1 with the links, in order — if they don't
+    # (e.g. a promo link got filtered out of `links` by extract_links_
+    # with_labels but its line still looked like a URL line here), we can't
+    # safely zip them together. Bail out to the legacy path rather than risk
+    # attaching the wrong URL to the wrong product/store.
+    if len(contexts) != len(links):
+        log.info(f"Roundup parse: context/link count mismatch ({len(contexts)} vs {len(links)}) — falling back")
+        return None
+
+    blocks = []
+    block_by_product = {}
+    for ctx, (_, url) in zip(contexts, links):
+        product = ctx["header"]
+        if product is None:
+            continue  # a link with no preceding product header — nothing sane to attach it to
+        block = block_by_product.get(product)
+        if block is None:
+            block = {"product": product, "stores": []}
+            block_by_product[product] = block
+            blocks.append(block)
+        block["stores"].append((ctx["store"], url))
+
+    total_slots = sum(len(b["stores"]) for b in blocks)
+    if len(blocks) < 1 or total_slots < 2:
+        return None
+
+    return blocks
 
 # ===========================================================================
 # Sealed product price lookup
@@ -725,6 +945,37 @@ def lookup_sealed_price(product: str, category: str = "trading cards") -> dict |
 
     return None
 
+# ===========================================================================
+# FIX 7: product plausibility gate — "weird products slipping through"
+#
+# Cheap keyword heuristic, run on every extracted product name before it's
+# allowed into an embed: requires at least one recognizable product-type
+# word (booster, box, tin, ETB, collection, etc). Catches the actual
+# garbage we've seen slip through — a bare store name, a boilerplate CTA
+# sentence ("Save this post…"), a hashtag fragment — none of which contain
+# any product-type word. Fails this → DROPPED, not posted at all.
+#
+# (An earlier version of this also soft-tagged products that didn't match
+# your Supabase catalog — removed per feedback; a new preorder announcement
+# legitimately won't be in the price catalog yet, and the tag wasn't a
+# useful signal in practice.)
+# ===========================================================================
+
+CARD_PRODUCT_KEYWORDS = {
+    "booster", "box", "boxes", "pack", "packs", "tin", "tins", "etb",
+    "trainer", "bundle", "bundles", "collection", "elite", "blaster",
+    "hobby", "mega", "jumbo", "hanger", "value", "cello", "gravity",
+    "fat", "case", "cases", "deck", "decks", "premium", "chest",
+    "chests", "series", "set", "sets", "expansion", "special",
+    "illustration", "promo", "card", "cards",
+}
+
+def _looks_like_card_product(product: str) -> bool:
+    if not product:
+        return False
+    tokens = {w.lower() for w in re.split(r'[\W_]+', product) if w}
+    return bool(tokens & CARD_PRODUCT_KEYWORDS)
+
 
 def format_price_line(tweet_price: str, sealed_match: dict) -> str:
     market = sealed_match["market_price"]
@@ -783,36 +1034,131 @@ def post_discord(tweet_data: dict, author_username: str):
     if not should_post(text, author_username):
         return
 
-    alert_type     = detect_alert_type(text)
-    category       = detect_category(text)
-    store          = detect_store(text)
-    color          = ALERT_COLORS.get(alert_type, 0x3498DB)
-    alert_emoji    = ALERT_EMOJIS.get(alert_type, "📣")
-    category_label = CATEGORY_EMOJIS.get(category, "🃏 Trading Cards")
+    alert_type       = detect_alert_type(text)
+    category         = detect_category(text)
+    # FIX 7: renamed from `store` — this is only the *whole-tweet* fallback
+    # guess (now unambiguous-only, see detect_store()). Per-link store
+    # attribution from _walk_line_context() takes priority over this
+    # wherever it's available; this is the last resort, not the default.
+    tweet_level_store = detect_store(text)
+    color            = ALERT_COLORS.get(alert_type, 0x3498DB)
+    alert_emoji      = ALERT_EMOJIS.get(alert_type, "📣")
+    category_label   = CATEGORY_EMOJIS.get(category, "🃏 Trading Cards")
+
+    # FIX 6: try grouping as a multi-product "roundup" tweet first (see
+    # parse_roundup_blocks docstring). Only tweets shaped like that will
+    # match; everything else falls through to the existing per-link logic
+    # unchanged.
+    roundup_blocks = parse_roundup_blocks(text, entities)
+    if roundup_blocks:
+        for block in roundup_blocks:
+            product = block["product"]
+
+            # FIX 7: drop products that don't even look like card/set names
+            # (bare store names, boilerplate CTAs, etc. that slipped past
+            # the noise filters) rather than posting them.
+            if not _looks_like_card_product(product):
+                log.info(f"Skipped implausible product (roundup): {product!r}")
+                continue
+
+            # Drop blocked links per-store rather than the whole product
+            stores = [
+                (s, u) for (s, u) in block["stores"]
+                if not is_blocked_link(s, u)
+            ]
+            if not stores:
+                log.info(f"Roundup: all store links blocked for {product!r} — skipping")
+                continue
+
+            store_names_for_fp = "+".join(sorted(s for s, _ in stores if s))
+            fingerprint = make_fingerprint(alert_type, store_names_for_fp, product)
+            if is_duplicate(fingerprint):
+                log.info(f"Duplicate suppressed (roundup): @{author_username} — {product[:40]}")
+                continue
+
+            price        = detect_price(text, context=product)
+            sealed_match = lookup_sealed_price(product, category) if product else None
+            price_line   = format_price_line(price, sealed_match) if sealed_match else None
+
+            store_links = " · ".join(
+                f"[{s or 'Link'}]({u})" for s, u in stores
+            )
+
+            lines = [f"📦 {product}"]
+            if store_links:
+                lines.append(f"🛒 {store_links}")
+            if price:
+                lines.append(f"💰 {price}")
+            if price_line:
+                lines.append(price_line)
+
+            embed = {
+                "title":       f"{alert_emoji} {category_label} — {alert_type.upper()}",
+                "url":         stores[0][1],
+                "description": '\n'.join(lines),
+                "color":       color,
+            }
+
+            resp = requests.post(
+                DISCORD_WEBHOOK,
+                json={"embeds": [embed]},
+                headers={"Content-Type": "application/json"},
+            )
+            if not resp.ok:
+                log.error(f"Discord error {resp.status_code}: {resp.text}")
+            else:
+                log.info(f"Posted roundup embed: {product[:40]} ({len(stores)} store link(s))")
+            time.sleep(0.3)
+        return
 
     labeled_links = extract_links_with_labels(text, entities)
 
     if labeled_links:
-        product_lines = parse_product_lines(text)
-        alerts_sent   = 0
+        # FIX 7: shared line-walker replaces the old `product_lines[i:]`
+        # index-guessing, which didn't actually correspond to the links
+        # list positionally and was grabbing wrong lines (e.g. "Best Buy"
+        # itself) as a "product name". Only used when the context count
+        # lines up 1:1 with the links — otherwise we can't trust the
+        # pairing and fall back to the single whole-tweet guess instead of
+        # risking a wrong attachment.
+        contexts    = _walk_line_context(text)
+        context_ok  = len(contexts) == len(labeled_links)
+        alerts_sent = 0
 
-        for i, (label, url) in enumerate(labeled_links[:6]):
+        for i, (label, url) in enumerate(labeled_links):
             # Skip membership upsells / affiliate links at the per-link level
             if is_blocked_link(label, url):
                 log.info(f"Skipped blocked link: {label!r} => {url[:60]}")
                 continue
 
-            product = clean_link_title(label)
-            if not product and i < len(product_lines):
-                product = product_lines[i]
-            if not product:
-                product = extract_product(text)
+            ctx = contexts[i] if context_ok else None
 
-            # FIX 2: Skip embed if product resolved to a URL fragment
+            product = clean_link_title(label)
             if is_url_like(product):
-                log.info(f"Skipped URL-shaped product name: {product!r} from @{author_username}")
-                # Try remaining product_lines before giving up
-                product = next((p for p in product_lines[i:] if not is_url_like(p)), None)
+                product = None
+                if ctx and ctx["own_text"] and len(ctx["own_text"]) >= 8 and not is_url_like(ctx["own_text"]):
+                    product = ctx["own_text"]
+                elif ctx and ctx["header"]:
+                    product = ctx["header"]
+                if not product:
+                    product = extract_product(text)
+
+            if product and is_url_like(product):
+                product = None
+
+            # FIX 7: only trust a store name when it's confidently tied to
+            # THIS specific link (read directly off that link's own line);
+            # otherwise fall back to the whole-tweet guess only if it's
+            # unambiguous (detect_store() now returns None when multiple
+            # different stores are mentioned anywhere in the tweet).
+            link_store = ctx["store"] if ctx else None
+            link_store_confident = bool(link_store)
+            store = link_store or tweet_level_store
+
+            # FIX 7: drop implausible product names outright
+            if product and not _looks_like_card_product(product):
+                log.info(f"Skipped implausible product: {product!r} from @{author_username}")
+                continue
 
             link_category      = detect_category(label or "") if label else category
             effective_category = link_category if link_category != "trading cards" else category
@@ -826,7 +1172,13 @@ def post_discord(tweet_data: dict, author_username: str):
                 continue
 
             meta_parts = []
-            if store: meta_parts.append(f"🏪 {store}")
+            # Only show the store emoji line when we have SOME store — but
+            # tag it "?" when it's the unconfirmed whole-tweet guess rather
+            # than read directly off this link's own line, so low-confidence
+            # attribution is visually distinguishable, not indistinguishable
+            # from a sure thing.
+            if store:
+                meta_parts.append(f"🏪 {store}" if link_store_confident else f"🏪 {store}?")
             if price: meta_parts.append(f"💰 {price}")
             meta_line = "  ·  ".join(meta_parts)
 
@@ -864,7 +1216,13 @@ def post_discord(tweet_data: dict, author_username: str):
         if is_url_like(product):
             product = None
 
+        # FIX 7: drop implausible product names here too
+        if product and not _looks_like_card_product(product):
+            log.info(f"Skipped implausible product (no-link path): {product!r} from @{author_username}")
+            product = None
+
         price = detect_price(text)
+        store = tweet_level_store
 
         fingerprint = make_fingerprint(alert_type, store, product or tweet_url)
         if is_duplicate(fingerprint):
